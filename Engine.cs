@@ -65,9 +65,15 @@ namespace WtClickerGUI
 
         // ---- 倒计时读取（应用内「总是展示宝箱」的 mm:ss 气泡；最多 2 个并行）
         double _cdRefreshEpoch;          // 最早一个气泡的刷新时刻
-        readonly List<double> _cdEpochs = new();   // 全部气泡的刷新时刻（每轮重建，升序）
+        readonly List<double> _cdEpochs = new();   // 全部气泡的刷新时刻（由跟踪列表重建，升序）
         double _cdSeenAt = -999;
         bool _cdWasActive;
+        bool _cdAllGoneLogged;
+
+        /// <summary>倒计时气泡跨帧跟踪：防止单帧漏读/误读让倒计时跳变
+        /// （曾见 06:03 → 07:46 跳升 106s = 气泡 A 单帧漏读后最小值跳到 B）</summary>
+        class CdTrack { public double Cx, Cy; public double Epoch; public int Anom; public double LastSeen; }
+        readonly List<CdTrack> _cdTracks = new();
 
         // ---- 次数胶囊读取（桌宠下方数字）：仅用于 UI 展示，不参与任何调度决策。
         //      原因：用户键鼠操作必然随时增加计数，任何「预期值校验」都会误判；
@@ -397,27 +403,65 @@ namespace WtClickerGUI
         void UpdateReadings(Frame frame)
         {
             // ---- 倒计时气泡读取（连续 2 个宝箱后的冷却 mm:ss 气泡，最多 2 个）
+            //      跨帧跟踪 + 异常值拒绝：按位置把读数关联到已跟踪气泡，
+            //      单帧漏读（跳变到另一气泡）或误读（模板失配）不改变跟踪值；
+            //      连续 4 帧（2s）偏差才接受修正。气泡消失按 8s 无读数判定。
             var cds = CountdownReader.Find(frame);
-            if (cds.Count > 0)
+            double cdNow = Now();
+            foreach (var c in cds)
             {
-                int minRem = int.MaxValue;
-                _cdEpochs.Clear();
-                foreach (var c in cds)
+                double cx = (c.X0 + c.X1) / 2.0, cy = (c.Y0 + c.Y1) / 2.0;
+                CdTrack t = null; double bd = double.MaxValue;
+                foreach (var k in _cdTracks)
                 {
-                    minRem = Math.Min(minRem, c.Seconds);
-                    _cdEpochs.Add(Now() + c.Seconds);
+                    double d = Math.Abs(k.Cx - cx) + Math.Abs(k.Cy - cy);
+                    if (d < bd) { bd = d; t = k; }
                 }
-                _cdEpochs.Sort();
-                _cdRefreshEpoch = _cdEpochs[0];
-                _cdSeenAt = Now();
-                if (!_cdWasActive)
-                    Log?.Invoke($"读到宝箱刷新倒计时 {minRem / 60}:{minRem % 60:D2}（共 {cds.Count} 个气泡），将按倒计时动态调度。");
-                _cdWasActive = true;
+                if (t == null || bd > 80)
+                {
+                    if (_cdWasActive)
+                        Log?.Invoke($"新倒计时气泡出现 @({cx:F0},{cy:F0})，剩余 {c.Seconds / 60}:{c.Seconds % 60:D2}，加入跟踪");
+                    _cdTracks.Add(new CdTrack { Cx = cx, Cy = cy, Epoch = cdNow + c.Seconds, LastSeen = cdNow });
+                    continue;
+                }
+                double expected = t.Epoch - cdNow;
+                if (Math.Abs(c.Seconds - expected) <= 4 || expected <= 0)
+                {
+                    t.Epoch = cdNow + c.Seconds; t.Anom = 0;
+                }
+                else if (++t.Anom >= 4)
+                {
+                    Log?.Invoke($"倒计时气泡读数与跟踪值偏差过大（跟踪剩余 {Math.Max(0, expected):F0}s，读到 {c.Seconds}s，" +
+                                "连续 4 帧）→ 接受新读数");
+                    t.Epoch = cdNow + c.Seconds; t.Anom = 0;
+                }
+                // 其余情况：单帧异常（漏读跳到邻近气泡/模板误读），丢弃本帧读数，保留跟踪值
+                t.Cx = cx; t.Cy = cy; t.LastSeen = cdNow;
             }
-            else if (_cdWasActive && Now() - _cdSeenAt > 8)
+            for (int i = _cdTracks.Count - 1; i >= 0; i--)
+                if (cdNow - _cdTracks[i].LastSeen > 8)
+                {
+                    Log?.Invoke($"一个倒计时气泡已消失（还剩 {_cdTracks.Count - 1} 个在跟踪）");
+                    _cdTracks.RemoveAt(i);
+                }
+            _cdEpochs.Clear();
+            foreach (var t in _cdTracks) _cdEpochs.Add(t.Epoch);
+            _cdEpochs.Sort();
+            if (_cdTracks.Count > 0)
+            {
+                _cdRefreshEpoch = _cdEpochs[0];
+                _cdSeenAt = cdNow;
+                if (!_cdWasActive)
+                    Log?.Invoke($"读到宝箱刷新倒计时 {(int)Math.Max(0, _cdEpochs[0] - cdNow) / 60}:" +
+                                $"{(int)Math.Max(0, _cdEpochs[0] - cdNow) % 60:D2}（共 {_cdTracks.Count} 个气泡），将按倒计时动态调度。");
+                _cdWasActive = true;
+                _cdAllGoneLogged = false;
+            }
+            else if (_cdWasActive && cdNow - _cdSeenAt > 8 && !_cdAllGoneLogged)
             {
                 _cdWasActive = false;
-                Log?.Invoke("倒计时气泡消失 → 后续宝箱将直接弹出，恢复正常全速连点。");
+                _cdAllGoneLogged = true;
+                Log?.Invoke("倒计时气泡全部消失 → 后续宝箱将直接弹出，恢复正常全速连点。");
             }
 
             // ---- 次数胶囊读取（只有本机桌宠有）：按位置连续性跟踪，
