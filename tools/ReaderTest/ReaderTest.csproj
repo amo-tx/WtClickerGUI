@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <AssemblyName>ReaderTest</AssemblyName>
+    <RootNamespace>ReaderTest</RootNamespace>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\..\CounterReader.cs" Link="CounterReader.cs" />
+    <Compile Include="..\..\CountdownReader.cs" Link="CountdownReader.cs" />
+    <Compile Include="..\..\ChestDetector.cs" Link="ChestDetector.cs" />
+    <Compile Include="ChestDiag.cs" Link="ChestDiag.cs" />
+    <Compile Include="FrameStub.cs" Link="FrameStub.cs" />
+    <Compile Include="Program.cs" Link="Program.cs" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,11 @@
+bin/
+obj/
+dist/
+*.log
+*.pdb
+tools/*.png
+tools/*.zoom*
+tools/tpl_*.txt
+tools/ReaderTest/bin/
+tools/ReaderTest/obj/
+.vs/

@@ -1,0 +1,895 @@
+using System;
+using System.Collections.Generic;
+using System.Threading;
+
+namespace WtClickerGUI
+{
+    /// <summary>
+    /// 连点引擎（2026-10-30 联机多桌宠版）：
+    /// - 计数：PostMessage → DesktopCatInput / 主窗 Tauri Window（实测均计入，位置无关）；
+    ///   空白点注入，不触碰桌宠本体；每次点击前校验空白点未被桌宠占据（防拖拽）。
+    /// - 视觉：PrintWindow 亮度掩码聚块（已修复邻域步长错位导致的碎片化）。
+    /// - 宝箱：橙色簇预筛 + 模板匹配（ChestDetector），与桌宠连通也能检出，天然支持多桌宠；
+    ///   连续 2 轮确认后经通道轮试点击，以模板消失判定开启。
+    /// - 拖动防护：大块快速移动（用户拖桌宠/桌宠走动）期间暂停宝箱动作，避免把点击
+    ///   打在移动中的桌宠上；桌面稳定后才恢复。
+    /// </summary>
+    internal class ClickerEngine
+    {
+        // ---- 配置（UI 修改）
+        public volatile bool WantRun;
+        public double Cps = 5.0;
+        public bool Humanize = true;
+        /// <summary>气泡期匀速模式（借鉴 WuwaTappoClicker 的 892.5ms 恒节奏）：把门槛缺口
+        /// 按剩余冷却时间摊开成低速匀速点击，替代「全速冲线后死停」。宝箱产出速率与全速
+        /// 方案相同（冷却才是瓶颈），但点击更平滑、不突发，且与用户手动操作共存更友好。</summary>
+        public bool PacedBubble = true;
+        public bool AutoChest = true;
+        public int Channel = 0;         // 0=自动 1=DesktopCatInput 2=主窗
+
+        // ---- 回调（引擎线程调用，UI 侧自行 marshal）
+        public Action<string> Log;
+
+        Thread _thread;
+        Thread _visThread;               // 视觉独立线程：截图/OCR 不再阻塞点击节奏
+        volatile bool _stop;
+        public bool Started;
+        readonly object _vsync = new();  // 视觉共享状态锁（基线/宝箱候选/空白点/主块）
+
+        IntPtr _inputHwnd, _mainHwnd, _injectHwnd, _rwhHwnd;
+        string _injectDesc = "";
+        Blob _pet;                       // 最大可见块（状态显示用）
+        int _clicks, _chests;
+        double _nextChestScan, _chestIgnoreUntil, _nextMacro, _nextVisScan;
+        Thread _chestThread;
+        double _nextHeartbeat;
+        int _microLeft;
+        readonly Random _rng = new Random();
+
+        // ---- 宝箱策略（10-31 修正）：每消耗 1000 计数得 1 宝箱；连续 2 个后
+        //      第 3 个起变为倒计时气泡。气泡 = 门槛已攒满、在排队冷却 → 气泡期间
+        //      暂停点击防计数溢出；宝箱图标出现仍立即点击（最高优先级，消耗 1000）
+        int _countX0, _countY0;
+        bool _countRectValid;
+
+        // ---- 视觉：基线 + 宝箱候选 + 运动状态
+        class Tracked { public Blob B; public int Missed; public double LostAt; }   // LostAt：进丢失缓冲的时刻
+        class ChestCand { public double Cx, Cy; public double Mad; public int Seen; }
+        readonly List<Tracked> _baseline = new();
+        readonly List<Tracked> _lostPets = new();   // 近期丢失块缓冲（联机桌宠拖动后按尺寸/位置重新关联，防删建刷屏）
+        readonly List<ChestCand> _chestCands = new();
+        bool _visionInit;
+        List<Blob> _lastBlobs = new();
+        Frame _frame;
+        double _motionUntil;             // 大块运动中 → 此时间前不做宝箱动作
+
+        // ---- 倒计时读取（应用内「总是展示宝箱」的 mm:ss 气泡；最多 2 个并行）
+        double _cdRefreshEpoch;          // 最早一个气泡的刷新时刻
+        readonly List<double> _cdEpochs = new();   // 全部气泡的刷新时刻（每轮重建，升序）
+        double _cdSeenAt = -999;
+        bool _cdWasActive;
+
+        // ---- 次数胶囊读取（桌宠下方数字）：仅用于 UI 展示，不参与任何调度决策。
+        //      原因：用户键鼠操作必然随时增加计数，任何「预期值校验」都会误判；
+        //      而决策也不需要它——宝箱图标弹出本身就是「攒满 1000」的信号。
+        long _countVal = -1;             // 最近一次视觉读数（-1 = 尚未读到）
+        double _countSeenAt = -999;
+        int _countLost;                  // 位置连续失锁轮数（0.5s/轮）
+        double _effCps;                  // 计划 CPS（展示用）
+
+        // ---- 计数验证
+        CountProbe _probe;
+        double _probeNext, _lastHashChange;
+        int _clicksNoCount;
+        bool _countConfirmed;
+        double _blankX = -1, _blankY;
+
+        public void Start()
+        {
+            _stop = false;
+            // 防休眠/锁屏（借鉴 WuwaTappoClicker）：挂机期间系统不睡、屏幕不灭
+            Native.SetThreadExecutionState(
+                Native.ES_CONTINUOUS | Native.ES_SYSTEM_REQUIRED | Native.ES_DISPLAY_REQUIRED);
+            Log?.Invoke("▶ 引擎线程已启动（视觉独立线程化：截图/OCR 与点击并行，实际点击速率≈设定 CPS；已阻止系统休眠/熄屏）");
+            _thread = new Thread(Run) { IsBackground = true };
+            _visThread = new Thread(VisLoop) { IsBackground = true };
+            _chestThread = new Thread(ChestLoop) { IsBackground = true };
+            _thread.Start();
+            _visThread.Start();
+            _chestThread.Start();
+        }
+
+        public void Shutdown()
+        {
+            _stop = true;
+            WantRun = false;
+            Native.SetThreadExecutionState(Native.ES_CONTINUOUS);   // 恢复系统电源策略
+            try { _thread?.Join(1200); } catch { }
+            try { _visThread?.Join(1200); } catch { }
+            try { _chestThread?.Join(1200); } catch { }
+        }
+
+        /// <summary>
+        /// 宝箱专用线程（0.3s 巡检，独立于点击节奏）。
+        /// 之前宝箱检测寄生在点击线程循环里，匀速模式下点击间隔被拉长到 1~4s，
+        /// 宝箱出现最坏要 4s 才被点——严重违背「弹出即点」最高优先级。现彻底解耦。
+        /// </summary>
+        void ChestLoop()
+        {
+            while (!_stop)
+            {
+                if (!WantRun || !AutoChest) { Thread.Sleep(250); continue; }
+                if (Now() < _nextChestScan) { Thread.Sleep(60); continue; }
+                _nextChestScan = Now() + 0.3;
+                try { ScanChest(); } catch { }   // 单次失败忽略，下轮重试
+            }
+        }
+
+        // ---------------------------------------------------------------- 主循环
+        void Run()
+        {
+            _microLeft = Rng(50, 100);
+            _nextMacro = Now() + RngD(10 * 60, 18 * 60);
+            while (!_stop)
+            {
+                if (!WantRun) { Thread.Sleep(200); continue; }
+
+                // ---- 窗口与注入通道
+                if (!RefreshWindows())
+                {
+                    EmitStatus("未检测到 WuwaTappo（请先启动 Wuwa Tappo）");
+                    Thread.Sleep(3000);
+                    continue;
+                }
+                ResolveChannel();
+                if (_injectHwnd == IntPtr.Zero)
+                {
+                    EmitStatus("未找到可注入的窗口通道");
+                    Thread.Sleep(3000);
+                    continue;
+                }
+
+                // ---- 视觉扫描已移至独立线程 VisLoop（0.5s 一帧），点击线程不再被截图/OCR 阻塞
+
+                // ---- 智能调度：气泡冷却期按倒计时降速，其余全速
+                var (wait, planDesc) = PlanWait();
+                StatusLine = BuildStatus(planDesc);   // 实时状态行（UI 卡片 100ms 同步显示）
+
+                // ---- 心跳（5s 一条落盘留档；实时内容在 UI 状态行 0.1s 刷新持续可见）
+                if (Now() >= _nextHeartbeat)
+                {
+                    _nextHeartbeat = Now() + 5;
+                    Heartbeat(planDesc);
+                }
+
+                // ---- 宝箱由独立线程 ChestLoop 巡检（0.3s，弹出即点），点击线程不再负责
+
+                while (wait > 0 && WantRun && !_stop)
+                {
+                    EmitStatus(planDesc);
+                    SleepInterruptible(Math.Min(wait, 5));
+                    if (!WantRun || _stop) break;
+                    StatusLine = BuildStatus(planDesc);
+                    if (Now() >= _nextHeartbeat) { _nextHeartbeat = Now() + 5; Heartbeat(planDesc); }
+                    (wait, planDesc) = PlanWait();
+                    StatusLine = BuildStatus(planDesc);
+                }
+                if (!WantRun || _stop) continue;
+
+                // ---- 拟人化：长休息（气泡激活且刷新临近时跳过，避免休息错过宝箱弹出）
+                bool cdUrgent;
+                lock (_sync) cdUrgent = _cdWasActive && Now() - _cdSeenAt < 6
+                                        && _cdRefreshEpoch - Now() < 300;
+                if (Humanize && Now() > _nextMacro && !cdUrgent)
+                {
+                    var pause = RngD(30, 60);
+                    EmitStatus($"长休息 {pause:F0}s（防异常检测）");
+                    SleepInterruptible(pause);
+                    _nextMacro = Now() + RngD(10 * 60, 18 * 60);
+                    continue;
+                }
+
+                // ---- 点击空白点（计数与位置无关；不触碰桌宠防拖拽）
+                // 抢鼠标防护：用户正按住物理左键（拖桌宠/拖其他东西）时，注入的
+                // WM_MOUSEMOVE/DOWN 会被应用当成拖拽事件 → 桌宠漂移。按住期间完全停手。
+                if (Native.LeftButtonDown)
+                {
+                    EmitStatus("检测到按住鼠标（拖动桌宠？），暂停注入防抢鼠标…");
+                    Thread.Sleep(150);
+                    continue;
+                }
+                double bx, by; bool occupied;
+                lock (_vsync) { bx = _blankX; by = _blankY; occupied = BlankOccupiedUnlocked(bx, by); }
+                if (bx < 0)
+                {
+                    EmitStatus("视觉扫描中（未获得可用空白点）…");
+                    Thread.Sleep(500);
+                    continue;
+                }
+                // 空白点占用校验：桌宠移到空白点附近时先让路（防把点击打在桌宠上）
+                if (occupied)
+                {
+                    EmitStatus("空白点被桌宠占据，等待下一次视觉扫描重新选点…");
+                    Thread.Sleep(400);
+                    continue;
+                }
+                int jx = (int)bx + Rng(-6, 6);
+                int jy = (int)by + Rng(-6, 6);
+                try { PostCount(jx, jy); }
+                catch (Exception ex) { Log?.Invoke("注入失败: " + ex.Message); Thread.Sleep(1500); continue; }
+                _clicks++;
+                if (!_countConfirmed) _clicksNoCount++;
+
+                // ---- 计数验证（每 10s 查一次计数文件哈希；文件周期性落盘）
+                if (_probe != null && _probe.Available && Now() >= _probeNext)
+                {
+                    _probeNext = Now() + 10;
+                    if (_probe.PollChanged())
+                    {
+                        _lastHashChange = Now();
+                        if (!_countConfirmed)
+                            Log?.Invoke($"✅ 计数文件已变化：注入点击计入累计（已注入 {_clicks} 次）");
+                        _countConfirmed = true;
+                        _clicksNoCount = 0;
+                    }
+                    else if (!_countConfirmed && _clicksNoCount >= 200 && Now() - _lastHashChange > 180)
+                    {
+                        Log?.Invoke("⚠️ 长时间注入未见计数文件更新——请检查 WuwaTappo 是否再次更新，" +
+                                    "或尝试在设置里切换注入通道。");
+                        _clicksNoCount = 0;
+                        _lastHashChange = Now();
+                    }
+                }
+
+                // ---- 拟人化：微休息
+                if (Humanize)
+                {
+                    _microLeft--;
+                    if (_microLeft <= 0)
+                    {
+                        EmitStatus($"微休息（已点 {_clicks}）");
+                        SleepInterruptible(RngD(2, 4));
+                        _microLeft = Rng(50, 100);
+                    }
+                }
+
+                // 宝箱检测已移至独立线程 ChestLoop（弹出即点，不受点击节奏影响）
+
+                EmitStatus(null);
+
+                // ---- 点击间隔（±40% 抖动；CPS 用智能调度的计划值）
+                SleepInterruptible(1.0 / Math.Max(0.3, PlanCps) * RngD(0.6, 1.4));
+            }
+        }
+
+        /// <summary>
+        /// 智能调度（10-31 12:10 规则）：全部以「实际看到的画面」为标准——
+        /// 排队宝箱数 = 屏幕上真实可见的倒计时气泡数（CountdownReader 实读，3s 内见过即有效），
+        /// 门槛 = 气泡数 × 1000；计数用 5s 内的实时 OCR 读数，过期/缺失不拿旧值决策。
+        /// 最快拿宝箱策略（自动选择）：
+        ///   ① 宝箱图标出现 → 最高优先级立即点击（领取即重置计数，拖久反而浪费溢出）；
+        ///   ② 有气泡排队且实时计数 ≥ 门槛 → 暂停防溢出（多点的全浪费）；
+        ///   ③ 有气泡排队但计数 < 门槛 → 全速补足门槛；
+        ///   ④ 无气泡 → 全速攒下一个 1000。
+        /// 不做任何「内部推断」：不说「下一个会变气泡」，出现什么调度什么。
+        /// </summary>
+        (double wait, string desc) PlanWait()
+        {
+            double now = Now();
+            bool cdActive = CdActive(now);
+            if (cdActive)
+            {
+                int queued;
+                lock (_sync) queued = Math.Max(1, _cdEpochs.Count);
+                double rem0 = Math.Max(0, _cdRefreshEpoch - now);
+                // 调度只信 5s 内的实时 OCR 读数（0.5s 扫一次，5s = 10 轮容忍）
+                long v;
+                lock (_sync) v = (now - _countSeenAt < 5) ? _countVal : -1;
+                long target = 1000L * queued;    // 每个排队宝箱领取需扣 1000
+                if (v >= 0 && v >= target)
+                {
+                    Paused = true;
+                    _effCps = 0;   // 暂停注入；等待循环内仍立即响应宝箱图标
+                    return (0.4, $"策略=暂停防溢出：{queued} 个气泡排队冷却 {TimeSpan.FromSeconds(rem0):mm\\:ss}" +
+                                 $"（实时计数 {v:N0} ≥ 门槛 {target:N0}，再点必溢出），气泡消失宝箱弹出即自动点击");
+                }
+                Paused = false;
+                string why = v < 0
+                    ? "实时计数未读到（不拿旧值决策）"
+                    : $"实时计数 {v:N0} < 门槛 {target:N0}";
+                // 匀速模式：缺口 (target−v) 摊到剩余冷却（留 45s 安全余量），
+                // 得出恒定低速速率（借鉴 WuwaTappoClicker 的 (30min−15s)/2000 ≈ 1.12 CPS 节奏）。
+                // 与全速殊途同归（宝箱产出瓶颈是 30min 冷却），但无突发、无死停。
+                if (PacedBubble && v >= 0 && rem0 > 60)
+                {
+                    double need = target - v;
+                    double rate = need / Math.Max(30, rem0 - 45);
+                    if (rate < Cps)
+                    {
+                        if (rate < 0.25) rate = 0.25;
+                        _effCps = rate;
+                        return (0, $"策略=匀速补门槛：{queued} 个气泡排队 {TimeSpan.FromSeconds(rem0):mm\\:ss}" +
+                                   $"（缺口 {need:N0} 次 / 剩余 {rem0:F0}s → {rate:F2} CPS 匀速），到点刚好攒满，期间静候宝箱弹出");
+                    }
+                }
+                _effCps = Cps;
+                return (0, $"策略=全速补门槛：{queued} 个气泡排队 {TimeSpan.FromSeconds(rem0):mm\\:ss}" +
+                           $"（{why}{(rem0 <= 60 ? "，冷却将尽改全速" : PacedBubble && v >= 0 ? "，缺口所需速率超过上限" : "")}），补足后自动暂停");
+            }
+            Paused = false;
+            _effCps = Cps;
+            return (0, null);   // 无气泡 → 全速攒下一个宝箱
+        }
+
+        /// <summary>倒计时气泡是否「实际在屏」（3s 内读到过 = 有效；无气泡即无排队，不内部推断）</summary>
+        bool CdActive(double now)
+        {
+            lock (_sync) return _cdWasActive && now - _cdSeenAt < 3;
+        }
+
+        /// <summary>
+        /// 实时状态快照（与心跳日志同格式）。
+        /// 引擎运行期间每次调度都重建（点击循环 ~5Hz、暂停期 0.4s 一次），
+        /// UI 线程每 300ms 读取一次同步到状态行/卡片 —— 心跳内容实时可见，不再等 15s。
+        /// </summary>
+        public volatile string StatusLine = "";
+
+        string BuildStatus(string planDesc)
+        {
+            double now = Now();
+            bool cdA = CdActive(now);
+            string vTxt;
+            lock (_sync)
+            {
+                vTxt = _countVal < 0 ? "未读取"
+                    : _countVal.ToString("N0") + (now - _countSeenAt < 5 ? "" : "（已过期）");
+            }
+            string needTxt = Paused
+                ? $"暂停点击（{QueuedBubbles} 个排队）"
+                : $"还需={NeededClicks}{(now - _countSeenAt < 5 ? "" : "（基于过期读数，仅供显示）")}";
+            return $"次数={vTxt} {needTxt} " +
+                   $"倒计时={(cdA ? $"{Math.Max(0, _cdRefreshEpoch - now):F0}s" : "无")} " +
+                   $"CPS={_effCps:F1} 已注入={_clicks} 宝箱={_chests} | {planDesc ?? "全速连点"}";
+        }
+
+        void Heartbeat(string planDesc)
+        {
+            Log?.Invoke("心跳: " + BuildStatus(planDesc));
+        }
+
+        // ---------------------------------------------------------------- 视觉
+        /// <summary>
+        /// 待机时由 UI 线程调用（UI 每 300ms tick 一次，本方法内部节流 ~0.5s）：
+        /// 扫一帧读「次数 + 倒计时」，让状态卡在未开始连点时也实时跟随桌宠数据。
+        /// 返回可见块数量（-1 = WuwaTappo 不在线 / 抓帧失败），供头部状态显示。
+        /// 引擎运行时由引擎线程自己读（本方法直接返回 -2 不做重复扫描）。
+        /// </summary>
+        public int ReadIdleVision()
+        {
+            if (WantRun || _stop) return -2;
+            double now = Now();
+            if (now < _idleNext) return IdleBlobCount;   // 节流：0.5s 内复用上次结果
+            _idleNext = now + 0.5;
+            try
+            {
+                var main = _mainHwnd != IntPtr.Zero && Native.IsWindow(_mainHwnd)
+                    ? _mainHwnd : Scanner.FindMainWindow();
+                if (main == IntPtr.Zero) { IdleBlobCount = -1; return -1; }
+                _mainHwnd = main;
+                var (frame, blobs) = Scanner.ScanFrame(main);
+                if (frame == null) { IdleBlobCount = -1; return -1; }
+                lock (_sync) UpdateReadings(frame);
+                IdleBlobCount = blobs.Count;
+                return blobs.Count;
+            }
+            catch { return -1; }
+        }
+
+        /// <summary>最近一次扫描的可见块数量（-1 = 不在线，-2 = 引擎自扫中）。</summary>
+        public volatile int IdleBlobCount = -2;
+        double _idleNext;                // 待机视觉节流（0.5s）
+        readonly object _sync = new();
+
+        /// <summary>
+        /// 倒计时气泡 + 次数胶囊读取（引擎线程与 UI 待机轮询共用）。
+        /// 共享状态在 _sync 锁内更新。调用方需已持有帧。
+        /// </summary>
+        void UpdateReadings(Frame frame)
+        {
+            // ---- 倒计时气泡读取（连续 2 个宝箱后的冷却 mm:ss 气泡，最多 2 个）
+            var cds = CountdownReader.Find(frame);
+            if (cds.Count > 0)
+            {
+                int minRem = int.MaxValue;
+                _cdEpochs.Clear();
+                foreach (var c in cds)
+                {
+                    minRem = Math.Min(minRem, c.Seconds);
+                    _cdEpochs.Add(Now() + c.Seconds);
+                }
+                _cdEpochs.Sort();
+                _cdRefreshEpoch = _cdEpochs[0];
+                _cdSeenAt = Now();
+                if (!_cdWasActive)
+                    Log?.Invoke($"读到宝箱刷新倒计时 {minRem / 60}:{minRem % 60:D2}（共 {cds.Count} 个气泡），将按倒计时动态调度。");
+                _cdWasActive = true;
+            }
+            else if (_cdWasActive && Now() - _cdSeenAt > 8)
+            {
+                _cdWasActive = false;
+                Log?.Invoke("倒计时气泡消失 → 后续宝箱将直接弹出，恢复正常全速连点。");
+            }
+
+            // ---- 次数胶囊读取（只有本机桌宠有）：按位置连续性跟踪，
+            //      过滤访客名牌数字等误检；位置突变连续 3s（桌宠被拖走）则
+            //      重新捕获，避免死锁在旧位置导致卡片永远「—」。
+            //      读数展示与恢复调度参考；气泡排队期间调度不依赖此值。
+            var cs = CounterReader.Find(frame);
+            if (cs.Count > 0)
+            {
+                CounterReader.CounterRead best = null;
+                if (_countRectValid)
+                {
+                    double bd = double.MaxValue;
+                    foreach (var c in cs)
+                    {
+                        double d = Math.Abs(c.X0 - _countX0) + Math.Abs(c.Y0 - _countY0);
+                        if (d < bd) { bd = d; best = c; }
+                    }
+                    if (bd > 150)
+                    {
+                        // 位置突变：疑似误检或桌宠移动。连续失锁 3s → 桌宠已移走，重新捕获
+                        if (++_countLost >= 6)
+                        {
+                            _countRectValid = false;
+                            _countLost = 0;
+                            Log?.Invoke("计数胶囊位置连续失锁 3s（桌宠已移动？），重新捕获。");
+                        }
+                        best = null;
+                    }
+                    else _countLost = 0;
+                }
+                else
+                {
+                    best = cs[0];
+                    foreach (var c in cs) if (c.Digits > best.Digits) best = c;
+                }
+                if (best != null)
+                {
+                    _countX0 = best.X0; _countY0 = best.Y0; _countRectValid = true;
+                    // 纯展示，零校验（用户裁决：内置计数逻辑完全舍去）。
+                    // v4 读取器的质量控制在读取端完成（✦ 结构锚点 + 模板 MAD 门槛），
+                    // 偶尔单帧失败会保留旧值并过期标记，0.5s 后自愈。
+                    // 注意：不可按「位数骤减」过滤 —— 领宝箱计数归零（1005→3）时
+                    // 位数 4→1 而胶囊区域不变，任何此类护栏都会永久拒绝合法复位。
+                    bool first = _countVal < 0;
+                    _countVal = best.Value;
+                    _countSeenAt = Now();
+                    if (first) Log?.Invoke($"✅ 已读取桌宠计数：{best.Value}（实时读数；气泡排队的暂停/恢复门槛判定以此为准，仅采信 5s 内的新鲜值）");
+                }
+            }
+        }
+
+        /// <summary>视觉独立线程：专职 0.5s 一帧截图+识别，点击线程完全不被阻塞。</summary>
+        void VisLoop()
+        {
+            while (!_stop)
+            {
+                if (!WantRun) { Thread.Sleep(200); continue; }
+                if (_mainHwnd == IntPtr.Zero || !Native.IsWindow(_mainHwnd)) { Thread.Sleep(300); continue; }
+                if (Now() < _nextVisScan) { Thread.Sleep(40); continue; }
+                _nextVisScan = Now() + 0.5;
+                try
+                {
+                    UpdateVision();   // 单帧失败忽略，下轮重扫
+                    // 状态行随视觉扫描重建（含倒计时剩余/CPS/策略），与点击节奏解耦，
+                    // 匀速模式下也不会出现「几十秒不变」的旧状态
+                    var (_, planDesc) = PlanWait();
+                    StatusLine = BuildStatus(planDesc);
+                }
+                catch { }
+            }
+        }
+
+        void UpdateVision()
+        {
+            var (frame, blobs) = Scanner.ScanFrame(_mainHwnd);
+            if (frame == null || blobs.Count == 0) return;
+
+            lock (_sync) UpdateReadings(frame);
+
+            bool firstInit = false; bool probeAvail = false;
+            lock (_vsync)
+            {
+                _frame = frame;
+                _lastBlobs = blobs;
+                IdleBlobCount = blobs.Count;
+
+                if (!_visionInit)
+                {
+                    _visionInit = true;
+                    firstInit = true;
+                    foreach (var b in blobs) _baseline.Add(new Tracked { B = b, Missed = 0 });
+                    if (_probe == null)
+                    {
+                        _probe = new CountProbe();
+                        _probeNext = Now() + 8;
+                        _lastHashChange = Now();
+                    }
+                }
+                else
+                {
+                    // ---- 运动检测：大块（N>=50）相对上一轮移动 > 40px → 拖拽/走动中
+                    //      仅当移动块靠近宝箱候选时才暂停宝箱动作——联机模式其他玩家
+                    //      拖动/走动自己的桌宠，不应耽误本机宝箱领取（宝箱点击每击前
+                    //      都会重抓帧重检测，本身就能跟上移动目标）。
+                    double maxMove = 0;
+                    foreach (var b in blobs)
+                    {
+                        if (b.N < 50) continue;
+                        double best = double.MaxValue;
+                        foreach (var p in _baseline)
+                            if (p.B.N >= 50) best = Math.Min(best, p.B.Dist(b));
+                        if (best < double.MaxValue) maxMove = Math.Max(maxMove, best);
+                    }
+                    if (maxMove > 40)
+                    {
+                        bool nearChest = false;
+                        foreach (var b in blobs)
+                        {
+                            if (b.N < 50) continue;
+                            foreach (var c in _chestCands)
+                                if (Math.Abs(b.Cx - c.Cx) < 130 && Math.Abs(b.Cy - c.Cy) < 130) { nearChest = true; break; }
+                            if (nearChest) break;
+                        }
+                        if (nearChest) _motionUntil = Now() + 2.5;   // 只有宝箱附近有块在动才暂停（静止后 2.5s 恢复）
+                    }
+
+                    // ---- 基线匹配更新（10-31 联机拖动修复）：
+                    //      位置容差 90px；匹配失败时先查「近期丢失」块——联机其他桌宠
+                    //      被拖动时一帧能跳 200px+，旧逻辑会把它当「消失+新出现」反复
+                    //      删建并刷屏日志；现在按尺寸相近（±45%）在 400px 内重新关联，
+                    //      只有真正新进入画面的块才记「新可见块」。
+                    var newlySeen = new List<Blob>();
+                    foreach (var b in blobs)
+                    {
+                        var m = _baseline.Find(t => t.B.Dist(b) < 90 && Math.Abs(t.B.N - b.N) < Math.Max(60, b.N / 3));
+                        if (m == null)
+                        {
+                            Tracked lost = null; double ld = double.MaxValue;
+                            foreach (var t in _lostPets)
+                            {
+                                double d = t.B.Dist(b);
+                                if (d < 400 && Math.Abs(t.B.N - b.N) < Math.Max(80, b.N * 0.45) && d < ld)
+                                { ld = d; lost = t; }
+                            }
+                            if (lost != null)
+                            {
+                                _lostPets.Remove(lost);
+                                lost.B = b; lost.Missed = 0;
+                                _baseline.Add(lost);
+                                continue;
+                            }
+                            newlySeen.Add(b);
+                            _baseline.Add(new Tracked { B = b, Missed = 0 });
+                        }
+                        else { m.B = b; m.Missed = 0; }
+                    }
+                    if (newlySeen.Count > 0)
+                        foreach (var b in newlySeen) Log?.Invoke($"新可见块进入画面：{b}");
+                }
+
+                foreach (var t in _baseline) t.Missed++;
+                for (int i = _baseline.Count - 1; i >= 0; i--)
+                    if (_baseline[i].Missed > 10)
+                    {
+                        var lost = _baseline[i];
+                        lost.LostAt = Now();
+                        _lostPets.Add(lost);              // 进近期丢失缓冲（拖动后能重新关联）
+                        if (_lostPets.Count > 8) _lostPets.RemoveAt(0);
+                        _baseline.RemoveAt(i);
+                    }
+                _lostPets.RemoveAll(t => Now() - t.LostAt > 6);
+
+                // ---- 宝箱：模板匹配（与桌宠连通也能检出，天然支持多桌宠）
+                UpdateChestCandidates();
+
+                _pet = PickPrimary(blobs);
+                SetBlankPoint(blobs);
+
+                if (firstInit && _probe != null) { probeAvail = _probe.Available; }
+            }
+
+            if (firstInit)
+            {
+                Blob pet; double bxx;
+                lock (_vsync) { pet = _pet; bxx = _blankX; }
+                Log?.Invoke($"视觉扫描就绪：{blobs.Count} 个可见块，主块 {pet}（通道 {_injectDesc}）");
+                Log?.Invoke($"点击模式: 空白点({bxx:F0},{_blankY:F0})" +
+                            (probeAvail ? "；将自动验证计数" : "；⚠️ 未找到计数文件，无法自动验证"));
+            }
+        }
+
+        static Blob PickPrimary(List<Blob> blobs)
+        {
+            Blob best = null;
+            foreach (var b in blobs)
+                if (b.N >= 4 && (best == null || b.N > best.N)) best = b;
+            return best;
+        }
+
+        // ---- 供 UI 轮询的运行状态（与引擎线程/UI 待机轮询共享 → 锁内读取）
+        public long CountVal { get { lock (_sync) return _countVal; } }
+        public bool CountFresh { get { lock (_sync) return Now() - _countSeenAt < 10; } }
+        /// <summary>气泡排队冷却期（次数已攒满，暂停点击防溢出）</summary>
+        public bool Paused { get; private set; }
+        /// <summary>当前排队冷却的宝箱数（屏幕上实际可见的倒计时气泡数，0 = 无排队）</summary>
+        public int QueuedBubbles
+        {
+            get { lock (_sync) return (_cdWasActive && Now() - _cdSeenAt < 3) ? _cdEpochs.Count : 0; }
+        }
+        public int Clicks => _clicks;
+        public int Chests { get { lock (_sync) return _chests; } }
+        public double PlanCps => _effCps > 0 ? _effCps : Cps;
+        public string LiveDesc = "";
+        /// <summary>距下一宝箱还需的点击次数（-1 = 次数未读取；0 = 已攒够 1000）</summary>
+        public int NeededClicks
+        {
+            get
+            {
+                lock (_sync)
+                {
+                    if (_countVal < 0) return -1;
+                    if (_countVal == 0) return 1000;
+                    long m = _countVal % 1000;
+                    return m == 0 ? 0 : (int)(1000 - m);
+                }
+            }
+        }
+        /// <summary>宝箱刷新倒计时剩余秒数（-1 = 当前无倒计时）</summary>
+        public double CdRemain
+        {
+            get
+            {
+                lock (_sync)
+                {
+            double now = Now();
+            bool a = _cdWasActive && now - _cdSeenAt < 3;
+            return a ? Math.Max(0, _cdRefreshEpoch - now) : -1;
+                }
+            }
+        }
+
+        void UpdateChestCandidates()
+        {
+            if (_frame == null) return;
+            var found = ChestDetector.Find(_frame.Bits, _frame.W, _frame.H);
+            foreach (var (cx, cy, mad) in found)
+            {
+                double sx = _frame.Left + cx, sy = _frame.Top + cy;
+                var c = _chestCands.Find(t => Math.Abs(t.Cx - sx) < 45 && Math.Abs(t.Cy - sy) < 45);
+                if (c != null) { c.Seen++; c.Mad = Math.Min(c.Mad, mad); }
+                else
+                {
+                    _chestCands.Add(new ChestCand { Cx = sx, Cy = sy, Mad = mad, Seen = 1 });
+                    Log?.Invoke($"宝箱候选出现 @({sx:F0},{sy:F0}) MAD={mad:F1}，等待第 2 轮确认…");
+                }
+            }
+            // 本轮未检出的候选移除（宝箱被点掉/消失）
+            _chestCands.RemoveAll(c => !found.Exists(f =>
+                Math.Abs(_frame.Left + f.Cx - c.Cx) < 45 && Math.Abs(_frame.Top + f.Cy - c.Cy) < 45));
+        }
+
+        // ---------------------------------------------------------------- 宝箱
+        void ScanChest()
+        {
+            if (Now() < _chestIgnoreUntil) return;
+            if (Now() < _motionUntil) return;          // 拖拽/走动中不动宝箱
+
+            ChestCand target = null;
+            lock (_vsync)
+            {
+                foreach (var c in _chestCands)
+                    if (c.Seen >= 2 && (target == null || c.Mad < target.Mad)) target = c;
+            }
+            if (target == null) return;
+
+            Log?.Invoke($"检测到宝箱 @({target.Cx:F0},{target.Cy:F0})（连续 {target.Seen} 轮确认，MAD={target.Mad:F1}），点击开启…");
+            EmitStatus("点击宝箱中…");
+
+            var chans = ChestChannels();
+            if (chans.Count == 0)
+            {
+                EmitStatus("未找到任何宝箱点击通道，30s 后重试");
+                _chestIgnoreUntil = Now() + 30;
+                return;
+            }
+
+            bool gone = false;
+            for (int attempt = 0; attempt < 9 && !gone && WantRun && !_stop; attempt++)
+            {
+                // 抢鼠标防护：用户按住左键（拖桌宠）期间不注入，稍后重试
+                if (Native.LeftButtonDown) { Thread.Sleep(400); continue; }
+                // 每击前重抓帧重检测（桌宠移动也跟得上；宝箱消失立即停手）
+                var (frame, _) = Scanner.ScanFrame(_mainHwnd);
+                if (frame != null)
+                {
+                    var found = ChestDetector.Find(frame.Bits, frame.W, frame.H);
+                    (double, double) cur = (double.NaN, double.NaN);
+                    foreach (var (cx, cy, mad) in found)
+                    {
+                        double sx = frame.Left + cx, sy = frame.Top + cy;
+                        if (Math.Abs(sx - target.Cx) < 60 && Math.Abs(sy - target.Cy) < 60) { cur = (sx, sy); break; }
+                    }
+                    if (double.IsNaN(cur.Item1)) { gone = true; break; }
+                    target.Cx = cur.Item1; target.Cy = cur.Item2;   // 跟随移动
+                    var (desc, hwnd) = chans[attempt % chans.Count];
+                    try { PostClickTo(hwnd, (int)cur.Item1 + Rng(-5, 5), (int)cur.Item2 + Rng(-5, 5)); }
+                    catch (Exception ex) { Log?.Invoke($"宝箱点击失败[{desc}]: " + ex.Message); continue; }
+                }
+                Thread.Sleep(Rng(900, 1200));
+            }
+            // 成功开启后只静默 5s（新宝箱可能马上又弹出——30s 静默曾造成「下一个宝箱没被立即点」）；
+            // 9 次点击仍失败才冷却 30s。
+            _chestIgnoreUntil = Now() + (gone ? 5 : 30);
+            lock (_vsync) _chestCands.Clear();       // 重新累积，避免残留
+            if (gone)
+            {
+                _chests++;
+                // 只陈述实际发生的事，不内部推断后续形态；是否出现倒计时气泡
+                // 以画面实际监测为准（出现即日志提示并自动调度）。
+                Log?.Invoke($"✅ 宝箱图标已消失 → 判定开启成功（本次运行已开 {_chests} 个）。" +
+                            "后续宝箱是直接弹出还是变倒计时气泡，以实际画面监测为准。");
+            }
+            else
+            {
+                Log?.Invoke("已轮试各通道点击 9 次图标仍在，30s 后重试（若持续失败请把日志发给开发者）。");
+            }
+        }
+
+        List<(string desc, IntPtr hwnd)> ChestChannels()
+        {
+            var list = new List<(string, IntPtr)>();
+            if (EnsureRwh()) list.Add(("RenderWidget", _rwhHwnd));
+            if (_mainHwnd != IntPtr.Zero) list.Add(("主窗", _mainHwnd));
+            if (_inputHwnd != IntPtr.Zero) list.Add(("DesktopCatInput", _inputHwnd));
+            return list;
+        }
+
+        bool EnsureRwh()
+        {
+            if (_rwhHwnd != IntPtr.Zero && Native.IsWindow(_rwhHwnd)) return true;
+            _rwhHwnd = Scanner.FindRwhHwnd(_mainHwnd);
+            return _rwhHwnd != IntPtr.Zero;
+        }
+
+        // ---------------------------------------------------------------- 注入
+        bool RefreshWindows()
+        {
+            _mainHwnd = Scanner.FindMainWindow();
+            _inputHwnd = Scanner.FindInputHwnd();
+            return _mainHwnd != IntPtr.Zero;
+        }
+
+        void ResolveChannel()
+        {
+            if (_injectHwnd != IntPtr.Zero && Native.IsWindow(_injectHwnd)) return;
+            _injectHwnd = IntPtr.Zero; _injectDesc = "";
+            var tryOrder = new List<(int ch, string desc, IntPtr h)>();
+            if (Channel == 0 || Channel == 1)
+                tryOrder.Add((1, "DesktopCatInput", _inputHwnd));
+            if (Channel == 0 || Channel == 2)
+                tryOrder.Add((2, "主窗Tauri", _mainHwnd));
+            foreach (var (ch, desc, h) in tryOrder)
+            {
+                if (h != IntPtr.Zero && Native.IsWindow(h))
+                {
+                    _injectHwnd = h; _injectDesc = desc;
+                    break;
+                }
+            }
+        }
+
+        void PostCount(int screenX, int screenY)
+        {
+            ResolveChannel();
+            if (_injectHwnd == IntPtr.Zero) throw new InvalidOperationException("无注入通道");
+            PostClickTo(_injectHwnd, screenX, screenY);
+        }
+
+        void PostClickTo(IntPtr hwnd, int screenX, int screenY)
+        {
+            int cx = screenX, cy = screenY;
+            if (Native.GetWindowRect(hwnd, out Native.RECT r))
+            {
+                cx -= r.Left; cy -= r.Top;              // 客户坐标
+            }
+            IntPtr lp = (IntPtr)(((cy & 0x7FFF) << 16) | (cx & 0xFFFF));
+            Native.PostMessage(hwnd, Native.WM_MOUSEMOVE, Native.Zero, lp);
+            Thread.Sleep(12);
+            Native.PostMessage(hwnd, Native.WM_LBUTTONDOWN, Native.MK_LBUTTON, lp);
+            Thread.Sleep(30);
+            Native.PostMessage(hwnd, Native.WM_LBUTTONUP, Native.Zero, lp);
+        }
+
+        /// <summary>供 UI「测试一次」调用：向空白点投递一次计数点击，返回描述</summary>
+        public string TestClick()
+        {
+            if (!RefreshWindows()) return "未检测到 WuwaTappo，请先启动 Wuwa Tappo";
+            ResolveChannel();
+            if (_injectHwnd == IntPtr.Zero) return "未找到注入通道";
+            var (frame, blobs) = Scanner.ScanFrame(_mainHwnd);
+            if (frame != null && blobs.Count > 0)
+            {
+                lock (_vsync)
+                {
+                    _frame = frame; _lastBlobs = blobs;
+                    _pet = PickPrimary(blobs); SetBlankPoint(blobs);
+                }
+            }
+            double tbx, tby;
+            lock (_vsync) { tbx = _blankX; tby = _blankY; }
+            if (tbx < 0) return "未获得可用空白点（视觉扫描失败？）";
+            try { PostCount((int)tbx, (int)tby); }
+            catch (Exception ex) { return "注入失败: " + ex.Message; }
+            return $"已通过 [{_injectDesc}] 向空白点 ({tbx:F0},{tby:F0}) 投递 1 次计数点击。" +
+                   "空白点不触碰桌宠、无动画；计数生效与否以日志自动验证为准。";
+        }
+
+        // ---------------------------------------------------------------- 空白点
+        /// <summary>空白点占用校验（调用方需持有 _vsync 锁）</summary>
+        bool BlankOccupiedUnlocked(double bx, double by)
+        {
+            if (bx < 0) return false;
+            foreach (var b in _lastBlobs)
+                if (Math.Abs(bx - b.Cx) < 80 && Math.Abs(by - b.Cy) < 80) return true;
+            return false;
+        }
+
+        /// <summary>选一个离所有可见块最远的屏幕点作为计数点击点</summary>
+        void SetBlankPoint(List<Blob> all)
+        {
+            int vx = Native.GetSystemMetrics(76), vy = Native.GetSystemMetrics(77);
+            int vw = Native.GetSystemMetrics(78), vh = Native.GetSystemMetrics(79);
+            double bestScore = double.MinValue, bx = double.MinValue, by = 0;
+            for (int y = vy + vh / 4; y <= vy + vh - 80; y += 100)
+            {
+                for (int x = vx + 80; x <= vx + vw - 80; x += 100)
+                {
+                    double minD = double.MaxValue;
+                    foreach (var b in all)
+                    {
+                        double d = Math.Max(Math.Abs(x - b.Cx), Math.Abs(y - b.Cy));
+                        if (d < minD) minD = d;
+                    }
+                    if (all.Count == 0) minD = 1e6;
+                    double centerBias = -(Math.Abs(x - (vx + vw / 2.0)) + Math.Abs(y - (vy + vh * 0.7))) / 2000.0;
+                    double score = Math.Min(minD, 500) + centerBias;
+                    if (score > bestScore) { bestScore = score; bx = x; by = y; }
+                }
+            }
+            if (bx > double.MinValue) { _blankX = bx; _blankY = by; }
+        }
+
+        // ---------------------------------------------------------------- 工具
+        double Now() => Environment.TickCount64 / 1000.0;
+        int Rng(int a, int b) => _rng.Next(a, b + 1);
+        double RngD(double a, double b) => a + _rng.NextDouble() * (b - a);
+
+        void SleepInterruptible(double seconds)
+        {
+            long end = Environment.TickCount64 + (long)(seconds * 1000);
+            while (!_stop && WantRun && Environment.TickCount64 < end)
+                Thread.Sleep(40);
+        }
+
+        void EmitStatus(string extra)
+        {
+            if (extra != null) { LiveDesc = extra; return; }
+            Blob pet;
+            lock (_vsync) pet = _pet;
+            string p = pet == null ? "未检测" : $"({pet.Cx:F0},{pet.Cy:F0})";
+            LiveDesc = $"桌宠 {p} · 通道 {_injectDesc} · {PlanCps:F1} CPS";
+        }
+    }
+}
