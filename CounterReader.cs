@@ -202,6 +202,23 @@ namespace WtClickerGUI
             if (inSeg) segs.Add((st, rw));
             segs.RemoveAll(g => g.e - g.s < 3);
             if (segs.Count == 0) return;
+
+            // ---- 非字形段过滤（2026-10-31 实机 2899 帧确诊）：
+            //      胶囊左侧圆角边框在行带内形成一个高仅 ~5px 的扁暗段（w8），
+            //      而真数字字形高 ~0.56×rh。扁段混入后模板匹配必失败并 return，
+            //      整次读数被一个边框杀死 → 次数永远「未读取」。
+            //      逐段实测竖直跨度，剔除高 < 0.45×rh 的段（数字/字母均 ≥0.5×rh）。
+            var real = new List<(int s, int e)>(segs.Count);
+            foreach (var g in segs)
+            {
+                int rmin = int.MaxValue, rmax = int.MinValue;
+                for (int y = 0; y < rh; y++)
+                    for (int x = g.s; x < g.e; x++)
+                        if (dark[y, x]) { if (y < rmin) rmin = y; if (y > rmax) rmax = y; }
+                if (rmin <= rmax && rmax - rmin + 1 >= 0.45 * rh) real.Add(g);
+            }
+            segs = real;
+            if (segs.Count == 0) return;
             bool dbg = Environment.GetEnvironmentVariable("CTR_DEBUG") == "1";
             if (dbg) Console.Error.WriteLine($"[CTR]   OCR tx[{tx0},{tx1}] ty[{ty0},{ty1}] rh={rh} 段=" +
                 string.Join(",", segs.Select(g => $"({g.s + tx0},{g.e + tx0})w{g.e - g.s}")));

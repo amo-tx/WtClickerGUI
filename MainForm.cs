@@ -18,9 +18,9 @@ namespace WtClickerGUI
         readonly System.Windows.Forms.Timer _uiTimer = new System.Windows.Forms.Timer();
 
         HeaderBar _header;
-        StatCard _cardCount, _cardNeed, _cardCd, _cardStat;
-        TrackBar _tbCps;
-        Label _lblCpsVal;
+        StatCard _cardCount, _cardNeed, _cardCd, _cardRate, _cardStat;
+        NumericUpDown _numCps;
+        Label _tipCps;
         ComboBox _cmbChannel;
         CheckBox _chkChest, _chkHuman, _chkPaced;
         RoundedButton _btnStart, _btnTest;
@@ -55,23 +55,25 @@ namespace WtClickerGUI
             // ================= 头部（Dock=Top，最后添加保证最顶） =================
             _header = new HeaderBar { Dock = DockStyle.Top, Height = 96 };
 
-            // ================= 状态卡行（TableLayoutPanel 四等分，随窗口拉伸） =================
+            // ================= 状态卡行（TableLayoutPanel 五等分，随窗口拉伸） =================
             var statTable = new TableLayoutPanel
             {
-                Dock = DockStyle.Top, Height = 90, ColumnCount = 4, RowCount = 1,
+                Dock = DockStyle.Top, Height = 90, ColumnCount = 5, RowCount = 1,
                 Margin = new Padding(0), Padding = new Padding(0)
             };
-            for (int i = 0; i < 4; i++)
-                statTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25f));
+            for (int i = 0; i < 5; i++)
+                statTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 20f));
             statTable.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
             _cardCount = NewCard("当前次数（视觉读取）");
             _cardNeed = NewCard("距下一宝箱");
             _cardCd = NewCard("宝箱刷新倒计时");
+            _cardRate = NewCard("实时点击速率");
             _cardStat = NewCard("本次连点 · 宝箱");
             statTable.Controls.Add(_cardCount, 0, 0);
             statTable.Controls.Add(_cardNeed, 1, 0);
             statTable.Controls.Add(_cardCd, 2, 0);
-            statTable.Controls.Add(_cardStat, 3, 0);
+            statTable.Controls.Add(_cardRate, 3, 0);
+            statTable.Controls.Add(_cardStat, 4, 0);
 
             // ================= 设置卡（Dock=Top，行距宽松） =================
             var cfg = new RoundedPanel
@@ -79,24 +81,23 @@ namespace WtClickerGUI
                 Dock = DockStyle.Top, Height = 214,
                 BackColor = Color.White, BorderColor = Border_, Padding = new Padding(18, 14, 18, 10)
             };
-            cfg.Controls.Add(MkLabel("点击速度", 18, 22, cfg, Ink, 9.5F, bold: true));
-            _tbCps = new TrackBar
+            cfg.Controls.Add(MkLabel("最快速率上限", 18, 22, cfg, Ink, 9.5F, bold: true));
+            _numCps = new NumericUpDown
             {
-                Location = new Point(120, 14),
-                Size = new Size(560, 34),                 // 固定宽度，不拉伸（否则盖住右侧 CPS 数值）
-                Minimum = 2, Maximum = 20, Value = 10,   // 0.5 步进 → 值 /2
-                TickStyle = TickStyle.None,
-                SmallChange = 1, LargeChange = 1
+                Location = new Point(120, 17),
+                Size = new Size(110, 28),
+                Minimum = 1, Maximum = 30, Value = 10,
+                DecimalPlaces = 1, Increment = 0.5M,
+                BorderStyle = BorderStyle.FixedSingle
             };
-            _tbCps.ValueChanged += (s, e) => { _lblCpsVal.Text = CpsText(); ApplyConfig(); };
-            cfg.Controls.Add(_tbCps);
-            _lblCpsVal = MkLabel("5.0 CPS", 692, 22, cfg, Accent, 10.5F, bold: true);
+            _tipCps = MkLabel("10.0 CPS（上限）", 244, 22, cfg, Accent, 10.5F, bold: true);
+            _numCps.ValueChanged += (s, e) => { _tipCps.Text = CpsText(); ApplyConfig(); };
+            cfg.Controls.Add(_numCps);
             // 注意：不要用 Anchor.Right —— OnLoad 的 Scale() 会把 anchor 右对齐的
-            // AutoSize label 推出窗口外（实测 x=2846 > 窗口右缘 2175）。固定 x 即可：
-            // 96dpi 时 692+92=784 紧跟滑杆(120+560=680)；×1.5 后同样紧邻。
+            // AutoSize label 推出窗口外。固定 x 即可。
 
             cfg.Controls.Add(MkLabel(
-                "智能调度：气泡排队（次数已攒满）时暂停点击防溢出；其余按桌宠下方计数全速攒下一个 1000，宝箱弹出立即点开",
+                "实际速率由程序按画面自主实时调节：无气泡全速（=上限）；气泡排队期把缺口按剩余冷却摊成匀速（≤上限），攒满即暂停防溢出；宝箱弹出立即点开",
                 18, 62, cfg, InkSoft, 8.5F));
 
             cfg.Controls.Add(MkLabel("注入通道", 18, 108, cfg, Ink, 9.5F, bold: true));
@@ -273,7 +274,7 @@ namespace WtClickerGUI
             return c;
         }
 
-        string CpsText() => (_tbCps.Value / 2.0).ToString("0.#") + " CPS";
+        string CpsText() => $"{_numCps.Value:0.#} CPS（上限）";
 
         // ---------------------------------------------------------------- 状态刷新
         void RefreshCards()
@@ -317,6 +318,11 @@ namespace WtClickerGUI
             _cardCd.ValueColor = cd < 0 ? InkSoft : Color.FromArgb(196, 106, 72);
 
             _cardStat.Value = $"{_engine.Clicks:N0} · {_engine.Chests}";
+
+            // 实时点击速率：4s 滑窗真实值（暂停/宝箱点击期间趋 0，全速期≈上限）
+            double acps = _engine.ActualCps;
+            _cardRate.Value = acps < 0.05 ? "0 /s" : $"{acps:F1} /s";
+            _cardRate.ValueColor = acps < 0.05 ? InkSoft : Color.FromArgb(96, 150, 90);
 
             // 状态行：引擎运行时显示与心跳日志同格式的实时快照（引擎 ~0.4-0.5s 重建，
             // 此处 300ms 同步），待机/未启动时回退到桌宠检测状态文本
@@ -374,7 +380,7 @@ namespace WtClickerGUI
         // ---------------------------------------------------------------- 配置与按钮
         void ApplyConfig()
         {
-            _engine.Cps = _tbCps.Value / 2.0;
+            _engine.Cps = (double)_numCps.Value;   // 仅为上限；实际速率由引擎按倒计时自主调节
             _engine.AutoChest = _chkChest.Checked;
             _engine.Humanize = _chkHuman.Checked;
             _engine.PacedBubble = _chkPaced.Checked;
@@ -390,7 +396,7 @@ namespace WtClickerGUI
             {
                 System.IO.File.WriteAllLines(ConfigPath, new[]
                 {
-                    "cpsX2=" + _tbCps.Value,
+                    "maxCps=" + ((double)_numCps.Value).ToString(System.Globalization.CultureInfo.InvariantCulture),
                     "autoChest=" + _chkChest.Checked,
                     "humanize=" + _chkHuman.Checked,
                     "pacedBubble=" + _chkPaced.Checked,
@@ -412,8 +418,10 @@ namespace WtClickerGUI
                     string k = line[..eq].Trim(), v = line[(eq + 1)..].Trim();
                     switch (k)
                     {
-                        case "cpsX2" when int.TryParse(v, out int cps):
-                            _tbCps.Value = Math.Clamp(cps, _tbCps.Minimum, _tbCps.Maximum); break;
+                        case "maxCps" when double.TryParse(v, System.Globalization.CultureInfo.InvariantCulture, out double mc):
+                            _numCps.Value = Math.Clamp((decimal)mc, _numCps.Minimum, _numCps.Maximum); break;
+                        case "cpsX2" when int.TryParse(v, out int cps):   // 旧版滑条配置迁移：值/2 = CPS
+                            _numCps.Value = Math.Clamp(cps / 2.0m, _numCps.Minimum, _numCps.Maximum); break;
                         case "autoChest" when bool.TryParse(v, out bool ac): _chkChest.Checked = ac; break;
                         case "humanize" when bool.TryParse(v, out bool hu): _chkHuman.Checked = hu; break;
                         case "pacedBubble" when bool.TryParse(v, out bool pb): _chkPaced.Checked = pb; break;
@@ -436,7 +444,7 @@ namespace WtClickerGUI
                 _btnStart.Base = Color.FromArgb(169, 84, 74);
                 _btnStart.Hover = Color.FromArgb(150, 70, 60);
                 _btnStart.Press = Color.FromArgb(130, 60, 52);
-                AppendLog($"▶ 已开始：{_engine.Cps:0.#} CPS，通道={_cmbChannel.Text}，" +
+                AppendLog($"▶ 已开始：最快速率 {_engine.Cps:0.#} CPS（实际速率由调度自动决定），通道={_cmbChannel.Text}，" +
                           $"自动宝箱={(_engine.AutoChest ? "开" : "关")}");
             }
             else

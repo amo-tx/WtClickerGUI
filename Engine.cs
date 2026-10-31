@@ -18,6 +18,9 @@ namespace WtClickerGUI
     {
         // ---- 配置（UI 修改）
         public volatile bool WantRun;
+        /// <summary>用户设定的最高速率上限（2026-10-31 起 UI 为数值框）。
+        /// 实际速率由程序按画面实时决定：气泡排队期匀速补门槛（可低于上限），
+        /// 其余全速 = 本上限。上限只是天花板，不再直接等于点击速率。</summary>
         public double Cps = 5.0;
         public bool Humanize = true;
         /// <summary>气泡期匀速模式（借鉴 WuwaTappoClicker 的 892.5ms 恒节奏）：把门槛缺口
@@ -83,6 +86,10 @@ namespace WtClickerGUI
         int _countLost;                  // 位置连续失锁轮数（0.5s/轮）
         double _effCps;                  // 计划 CPS（展示用）
 
+        // ---- 实际点击速率（UI 实时速率卡）：注入时刻滑窗统计
+        readonly List<double> _clickTimes = new();
+        const double CpsWindow = 4.0;    // 4s 滑窗（兼顾响应速度与平稳）
+
         // ---- 计数验证
         CountProbe _probe;
         double _probeNext, _lastHashChange;
@@ -116,17 +123,18 @@ namespace WtClickerGUI
         }
 
         /// <summary>
-        /// 宝箱专用线程（0.3s 巡检，独立于点击节奏）。
+        /// 宝箱专用线程（0.2s 巡检，独立于点击节奏）。
         /// 之前宝箱检测寄生在点击线程循环里，匀速模式下点击间隔被拉长到 1~4s，
         /// 宝箱出现最坏要 4s 才被点——严重违背「弹出即点」最高优先级。现彻底解耦。
+        /// 0.3→0.2s（2026-10-31 零空窗期）：气泡弹出→宝箱图标出现的最坏确认延迟 0.4s。
         /// </summary>
         void ChestLoop()
         {
             while (!_stop)
             {
                 if (!WantRun || !AutoChest) { Thread.Sleep(250); continue; }
-                if (Now() < _nextChestScan) { Thread.Sleep(60); continue; }
-                _nextChestScan = Now() + 0.3;
+                if (Now() < _nextChestScan) { Thread.Sleep(40); continue; }
+                _nextChestScan = Now() + 0.2;
                 try { ScanChest(); } catch { }   // 单次失败忽略，下轮重试
             }
         }
@@ -224,6 +232,11 @@ namespace WtClickerGUI
                 try { PostCount(jx, jy); }
                 catch (Exception ex) { Log?.Invoke("注入失败: " + ex.Message); Thread.Sleep(1500); continue; }
                 _clicks++;
+                lock (_sync)
+                {
+                    _clickTimes.Add(Now());
+                    if (_clickTimes.Count > 600) _clickTimes.RemoveRange(0, 300);   // 30CPS×4s=120 足够，硬上限防泄漏
+                }
                 if (!_countConfirmed) _clicksNoCount++;
 
                 // ---- 计数验证（每 10s 查一次计数文件哈希；文件周期性落盘）
@@ -254,7 +267,7 @@ namespace WtClickerGUI
                     if (_microLeft <= 0)
                     {
                         EmitStatus($"微休息（已点 {_clicks}）");
-                        SleepInterruptible(RngD(2, 4));
+                        SleepInterruptible(RngD(1.5, 3));   // 2~4s→1.5~3s：全速积攒期每次微休息都是纯空窗，收紧但不取消（保留拟人节奏）
                         _microLeft = Rng(50, 100);
                     }
                 }
@@ -355,7 +368,7 @@ namespace WtClickerGUI
                 : $"还需={NeededClicks}{(now - _countSeenAt < 5 ? "" : "（基于过期读数，仅供显示）")}";
             return $"次数={vTxt} {needTxt} " +
                    $"倒计时={(cdA ? $"{Math.Max(0, _cdRefreshEpoch - now):F0}s" : "无")} " +
-                   $"CPS={_effCps:F1} 已注入={_clicks} 宝箱={_chests} | {planDesc ?? "全速连点"}";
+                   $"速率={_effCps:F1}→{ActualCps:F1}/s 已注入={_clicks} 宝箱={_chests} | {planDesc ?? "全速连点"}";
         }
 
         void Heartbeat(string planDesc)
@@ -675,6 +688,22 @@ namespace WtClickerGUI
         public int Clicks => _clicks;
         public int Chests { get { lock (_sync) return _chests; } }
         public double PlanCps => _effCps > 0 ? _effCps : Cps;
+        /// <summary>实际点击速率（次/秒，4s 滑窗）：UI「实时点击速率」卡与状态行使用。
+        /// 与计划速率的区别：暂停/宝箱点击/微休息期间为真实值（趋 0），计划值不变。</summary>
+        public double ActualCps
+        {
+            get
+            {
+                double now = Now();
+                int n;
+                lock (_sync)
+                {
+                    _clickTimes.RemoveAll(t => now - t > CpsWindow);
+                    n = _clickTimes.Count;
+                }
+                return n / CpsWindow;
+            }
+        }
         public string LiveDesc = "";
         /// <summary>距下一宝箱还需的点击次数（-1 = 次数未读取；0 = 已攒够 1000）</summary>
         public int NeededClicks
@@ -734,7 +763,14 @@ namespace WtClickerGUI
             lock (_vsync)
             {
                 foreach (var c in _chestCands)
-                    if (c.Seen >= 2 && (target == null || c.Mad < target.Mad)) target = c;
+                {
+                    // 确认门槛（零空窗期 2026-10-31）：
+                    //   常规 = 连续 2 轮（0.2s 巡检 → 最坏 0.4s）；
+                    //   快道 = 单轮但 MAD<10 —— 掩码 MAD 实测真宝箱 0~9、干扰簇 47+，
+                    //          高置信单帧直接点，气泡弹出→开箱最坏延迟从 ~0.9s 压到 ~0.2s。
+                    bool confirmed = c.Seen >= 2 || (c.Seen >= 1 && c.Mad < 10);
+                    if (confirmed && (target == null || c.Mad < target.Mad)) target = c;
+                }
             }
             if (target == null) return;
 
@@ -773,17 +809,38 @@ namespace WtClickerGUI
                 }
                 Thread.Sleep(Rng(900, 1200));
             }
-            // 成功开启后只静默 5s（新宝箱可能马上又弹出——30s 静默曾造成「下一个宝箱没被立即点」）；
-            // 9 次点击仍失败才冷却 30s。
-            _chestIgnoreUntil = Now() + (gone ? 5 : 30);
-            lock (_vsync) _chestCands.Clear();       // 重新累积，避免残留
+            // 成功开启后只静默 1s（新宝箱可能马上又弹出——5s/30s 静默都会造成
+            // 「下一个宝箱弹出却不被立即点」的空窗期）；9 次点击仍失败才冷却 30s。
+            _chestIgnoreUntil = Now() + (gone ? 1 : 30);
+            // 只移除已开启的这一个候选（≤60px），其他同时在屏的宝箱保留确认状态
+            // ——整表 Clear 曾让并存宝箱重新从 0 累积确认轮数，白白多等 0.4~0.8s。
+            lock (_vsync)
+                _chestCands.RemoveAll(c =>
+                    Math.Abs(c.Cx - target.Cx) < 60 && Math.Abs(c.Cy - target.Cy) < 60);
             if (gone)
             {
                 _chests++;
-                // 只陈述实际发生的事，不内部推断后续形态；是否出现倒计时气泡
-                // 以画面实际监测为准（出现即日志提示并自动调度）。
-                Log?.Invoke($"✅ 宝箱图标已消失 → 判定开启成功（本次运行已开 {_chests} 个）。" +
-                            "后续宝箱是直接弹出还是变倒计时气泡，以实际画面监测为准。");
+                // 零空窗期关键一步：刚开的宝箱必来自一个已到期/即将到期的倒计时气泡。
+                // 立即移除这些气泡排队（原来要等 8s 无读数才判定消失），
+                // 门槛 1000×排队数马上回落，匀速/暂停策略立刻按真实排队数重算——
+                // 否则这 8s 里引擎会朝一个虚高的门槛多积攒（多点的全浪费）或错误暂停。
+                int removed = 0;
+                double nowC = Now();
+                lock (_sync)
+                {
+                    removed = _cdTracks.RemoveAll(t => t.Epoch <= nowC + 10);
+                    if (removed > 0)
+                    {
+                        _cdEpochs.Clear();
+                        foreach (var t in _cdTracks) _cdEpochs.Add(t.Epoch);
+                        _cdEpochs.Sort();
+                        if (_cdTracks.Count > 0) _cdRefreshEpoch = _cdEpochs[0];
+                        else { _cdWasActive = false; _cdSeenAt = -999; }
+                    }
+                }
+                Log?.Invoke($"✅ 宝箱已开启（本次运行已开 {_chests} 个）" +
+                            (removed > 0 ? $"，移除 {removed} 个已到期气泡排队，立即转入下一段积攒" :
+                                           "。后续宝箱形态以实际画面监测为准。"));
             }
             else
             {
