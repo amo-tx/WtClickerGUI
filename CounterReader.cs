@@ -183,17 +183,73 @@ namespace WtClickerGUI
                 }
                 i2 = j;
             }
+
+            // ---- 黑圆钮锚点（2026-10-31 23:10，合并名牌带场景）：本机胶囊挤进联机
+            //      名牌长带时，按钮列光被圆钮内浅色星星垫高（实测列光 15 > 阈值 10.8），
+            //      「暗隙→回光」锚点失配。改找圆钮本体：实心近黑圆盘 = 连续 ≥12 网格列、
+            //      每列窗口内 mn<90 的暗行 ≥13。数字笔画（宽 2~4 列、暗行 ~10）与
+            //      ☰ 细横条、名牌文字都达不到；宠物深色块由 OCR 模板 MAD 兜底剔除。
+            //      OCR 右缘强制止于圆钮左缘，星星像素不进段列表（根治 22:17 帧的
+            //      「圆钮左缘细段截断从右收集」问题）。
+            //      始终执行（不因轻跑锚点命中而跳过）：合并名牌带里轻跑锚点会命中
+            //      但 capW 超限被拒（实测 capW=630>500），真正能读出数字的是本锚点。
+            //      DminRows=10（像素，逐行统计）：圆钮是「黑环+橙星心」，环的每列
+            //      连续暗行被星形截断成两段 13~15px（实测）；若按网格步长2采样只剩
+            //      6~7 个样本永远不达标。数字竖笔画 ~18px 虽达标但仅宽 2~4px
+            //      （1~2 网格列），被 DminCols=12 排除；整列黑背景区由 DmaxCols 兜底。
+            {
+                const int DminRows = 10, DminCols = 12, DmaxCols = 26;
+                var darkRun = new int[nc];
+                var fbits = f.Bits;
+                int fw = f.W, fh = f.H;
+                for (int ix = 0; ix < nc; ix++)
+                {
+                    int px = ix * GridStep;
+                    if (px >= fw) { darkRun[ix] = 0; continue; }
+                    int best = 0, cur = 0;
+                    for (int py = by0; py <= by1; py++)
+                    {
+                        if (py >= fh) break;
+                        int i = (py * fw + px) * 4;
+                        int mn = fbits[i];
+                        if (fbits[i + 1] < mn) mn = fbits[i + 1];
+                        if (fbits[i + 2] < mn) mn = fbits[i + 2];
+                        if (mn < 90) { cur++; if (cur > best) best = cur; }
+                        else cur = 0;
+                    }
+                    darkRun[ix] = best;
+                }
+                int runCols = 0;
+                for (int ix = 0; ix <= nc; ix++)
+                {
+                    bool on = ix < nc && darkRun[ix] >= DminRows;
+                    if (on) { runCols++; continue; }
+                    if (runCols >= DminCols && runCols <= DmaxCols)
+                    {
+                        int circleL = (ix - runCols) * GridStep, circleR = (ix - 1) * GridStep;
+                        if (circleL - 190 >= 0)
+                        {
+                            if (dbg) Console.Error.WriteLine(
+                                $"[CTR] win[{by0},{by1}] 黑圆钮锚点 x[{circleL},{circleR}] 暗行={darkRun[ix - runCols + runCols / 2]}");
+                            TryOcr(f, circleL - 190, circleR + 2, by0, by1, result, circleL - 4);
+                        }
+                    }
+                    runCols = 0;
+                }
+            }
         }
 
-        /// <summary>对 [capLeft,capRight]×[by0,by1] 的数字胶囊 OCR：右起收集、大间隔截断、粘连拆分、模板匹配</summary>
-        static void TryOcr(Frame f, int capLeft, int capRight, int by0, int by1, List<CounterRead> result)
+        /// <summary>对 [capLeft,capRight]×[by0,by1] 的数字胶囊 OCR：右起收集、大间隔截断、粘连拆分、模板匹配。
+        /// tx1Override &gt; 0 时强制 OCR 右缘（黑圆钮锚点用：止于圆钮左缘，星形像素不进段列表）。</summary>
+        static void TryOcr(Frame f, int capLeft, int capRight, int by0, int by1, List<CounterRead> result,
+            int tx1Override = -1)
         {
             int w = f.W;
             var bits = f.Bits;
             int bh = by1 - by0;
             int capW = capRight - capLeft;
             int tx0 = capLeft + (int)(capW * 0.03);
-            int tx1 = capRight - (int)(capW * 0.02);
+            int tx1 = tx1Override > 0 ? tx1Override : capRight - (int)(capW * 0.02);
             // 温和竖直裁剪（悬垂描边污染主要由字形行段清理兜底）；蓝皮肤数字
             // RGB≈(21,26,37)、暖皮肤 ≈(74,52,35)，lum<135 均可靠检出
             int ty0 = by0 + (int)(bh * 0.20), ty1 = by1 - (int)(bh * 0.12);
@@ -236,6 +292,28 @@ namespace WtClickerGUI
             segs.RemoveAll(g => g.e - g.s < 3);
             if (segs.Count == 0) return;
             bool dbg = Environment.GetEnvironmentVariable("CTR_DEBUG") == "1";
+
+            // 非字形段预过滤（2026-10-31 22:xx 奶油皮肤实测教训）：✦ 星形按钮中心
+            // 只有 1 行暗像素，但它排在段列表最右——「从右往左收集」从它起步后
+            // 立即被 0.9×rh 大间隔截断，数字段全部落选 → 整读失败（次数永久过期）。
+            // 先算每段最大连续活动行数，<8px 的非字形段（星心/碎描边）提前剔除，
+            // 收集逻辑就能直接从数字段起步。数字高 ≥18px（rh 的 0.5 倍），阈值 8 安全。
+            segs.RemoveAll(g =>
+            {
+                int act = Math.Max(2, (g.e - g.s) / 8);
+                int bestLen = 0, curLen = 0;
+                for (int y = 0; y < rh; y++)
+                {
+                    int c = 0;
+                    for (int x = g.s; x < g.e; x++) if (dark[y, x]) c++;
+                    if (c >= act) { curLen++; if (curLen > bestLen) bestLen = curLen; }
+                    else curLen = 0;
+                }
+                if (dbg && bestLen < 8)
+                    Console.Error.WriteLine($"[CTR]   非字形段 x[{g.s + tx0},{g.e + tx0}] 最大连续活动行={bestLen}<8 剔除");
+                return bestLen < 8;
+            });
+            if (segs.Count == 0) return;
             if (dbg) Console.Error.WriteLine($"[CTR]   OCR tx[{tx0},{tx1}] ty[{ty0},{ty1}] rh={rh} 段=" +
                 string.Join(",", segs.Select(g => $"({g.s + tx0},{g.e + tx0})w{g.e - g.s}")));
 
