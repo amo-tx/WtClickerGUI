@@ -8,6 +8,13 @@ namespace ReaderTest
     {
         static void Main(string[] args)
         {
+            // --live [保存路径]：走引擎同款 PrintWindow 抓帧路径实测（不做 alpha 合成）
+            if (args.Length > 0 && args[0] == "--live")
+            {
+                WtClickerGUI.LiveCap.Run(args.Length > 1 ? args[1] : null);
+                return;
+            }
+
             foreach (var path in args)
             {
                 byte[] all = File.ReadAllBytes(path);

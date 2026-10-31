@@ -5,18 +5,25 @@ using System.Linq;
 namespace WtClickerGUI
 {
     /// <summary>
-    /// 桌宠「当前点击次数」胶囊读取 v4（2026-10-31 联机版，像素实测校准）：
-    /// 本机桌宠底栏结构 = [计数数字][黑底米色✦圆钮][奶油底☰圆钮]，无用户名；
-    /// 其他玩家的名牌只有用户名（可能含数字，如「13号」），没有 ✦ 圆钮 —— 结构级区别。
-    /// 名牌与底栏会无缝相邻（联机帧实测），靠右侧 ✦ 锚点 + 数字大间隔规则隔离。
-    /// 算法（全部基于列光剖面，不依赖连通域完整分离）：
-    ///   ① 行光剖面找「底栏行带」（连续行光≥40 格，高 24~70px）；
-    ///   ② 带内找 ✦ 特征：全光段(≥0.5×峰值, ≥40px) → 50px 内出现 ≥4 格纯黑隙(L≤0.15×峰值)
-    ///      → 星列(0<L≤0.75×峰值) → 28px 内回到全光（☰ 圆钮）；
-    ///   ③ 胶囊右缘=全光段末端，左缘向左扫（阈值 0.35×峰值，容 2 格缺口；可能扫进相邻名牌）；
-    ///   ④ OCR 行带取竖直中心 25%~82%（避开垂进画面的桌宠耳朵/尾巴描边）；
-    ///      从右往左收集字形段，遇到大间隔(>0.9×字高，即用户名与计数的布局间隔)停止；
-    ///   ⑤ 粘连段按估计字宽(0.42×字高)均分拆分后逐字模板匹配（复用倒计时 16x24 模板）。
+    /// 桌宠「当前点击次数」胶囊读取 v5（2026-10-31 晚，蓝色皮肤 + 高带融合版）：
+    /// 本机桌宠底栏结构 = [计数数字][✦圆钮][☰圆钮]，无用户名；其他玩家名牌只有用户名。
+    /// v5 起因（实机落盘帧 ctr_fail_1.bin 确诊，两个独立致因）：
+    ///   ① 用户切换桌宠皮肤后，✦ 圆钮由「奶油底+深色星隙」变为「黑圆钮+浅蓝星」，
+    ///      旧 ✦ 模式要求「星列必现」失配；
+    ///   ② 桌宠站到其他宠物上方/相邻时，胶囊行带与桌宠身体、名牌融成 190px+ 高带，
+    ///      旧「行带高 24~70px」上限直接跳过 —— 两种情况都导致次数永远「未读取」。
+    /// 算法：
+    ///   ① 浅色掩码（三通道最小值 > 180，步长 2 网格）+ 行方向前缀和 →
+    ///      任意行窗口的列光剖面 O(1)/列；
+    ///   ② 行带 = 行光 ≥40 格的极大连续段（高 ≥24px，上限 640px，不再限 70px）；
+    ///   ③ 高度 ≤70px 的带整带扫描；更高的带用滑窗（高 40/54/68px、步进 4px）
+    ///      逐窗扫描 —— 胶囊行带被融合时仍能命中；
+    ///   ④ ✦ 锚点统一为：全光段(≥40px) → 64px 内出现 ≥4 格黑隙(L≤0.15×峰值)
+    ///      → 回到全光（旧主题经星列回光、新主题经黑钮回光，均匹配；
+    ///      名牌误锚由 OCR 模板 MAD 拒绝兜底）；
+    ///   ⑤ OCR：右起收集、大间隔截断、粘连拆分、模板匹配（16x24）；
+    ///      字形竖直范围取「最大连续活动行段」抗悬垂描边污染，
+    ///      高度过滤自适应（≥8px 且 ≥0.5×最高字形），最左字形失败可丢弃重试。
     /// </summary>
     internal static class CounterReader
     {
@@ -27,6 +34,11 @@ namespace WtClickerGUI
             public int X0, Y0, X1, Y1;
         }
 
+        const int GridStep = 2;          // 采样步长（px）
+        const int BandMinRows = 12;      // 行带最小高（网格行，=24px）
+        const int BandMaxRows = 320;     // 行带最大高（=640px）
+        static readonly int[] WinRows = { 20, 27, 34 };   // 滑窗高度（网格行 = 40/54/68px）
+
         public static List<CounterRead> Find(Frame f)
         {
             var result = new List<CounterRead>();
@@ -34,139 +46,147 @@ namespace WtClickerGUI
             CountdownReader.EnsureLoaded();
             int w = f.W, h = f.H;
             var bits = f.Bits;
+            int gh = (h + GridStep - 1) / GridStep, gw = (w + GridStep - 1) / GridStep;
 
-            // ---- 浅色掩码（奶油/白底：三通道最小值 > 180），步长 2
-            var light = new HashSet<(int, int)>();
-            var rowL = new Dictionary<int, int>();
-            for (int y = 0; y + 1 < h; y += 2)
+            // ---- 浅色掩码 + 行前缀和：S[iy+1, ix] = 网格行 0..iy 中列 ix 的浅色格数
+            var S = new int[gh + 1, gw];
+            var rowL = new int[gh];
+            for (int iy = 0; iy < gh; iy++)
             {
-                int row = y * w * 4;
-                for (int x = 0; x + 1 < w; x += 2)
+                int y = iy * GridStep, row = y * w * 4, cnt = 0;
+                for (int ix = 0; ix < gw; ix++)
                 {
-                    int i = row + x * 4;
+                    // 网格列 ix 对应像素 x=ix*2，字节偏移 = x*4 = ix*8
+                    //（曾误写 ix*4 导致只扫每行左半屏且坐标错位 —— v5 首版全灭的根因）
+                    int i = row + ix * 8;
                     int mn = bits[i];
                     if (bits[i + 1] < mn) mn = bits[i + 1];
                     if (bits[i + 2] < mn) mn = bits[i + 2];
-                    if (mn > 180)
-                    {
-                        light.Add((x, y));
-                        rowL[y] = rowL.TryGetValue(y, out int c) ? c + 1 : 1;
-                    }
+                    if (mn > 180) { cnt++; S[iy + 1, ix] = S[iy, ix] + 1; }
+                    else S[iy + 1, ix] = S[iy, ix];
                 }
+                rowL[iy] = cnt;
             }
 
-            // ---- 行带：连续行光 ≥40 采样格、高度 24~70px 的横条（底栏行）
-            var ys = new List<int>(rowL.Keys);
-            ys.Sort();
-            var bands = new List<(int y0, int y1)>();
-            int bs = -1, bp = -1;
-            foreach (int y in ys)
+            // ---- 行带：行光 ≥40 格的极大连续段
+            var bands = new List<(int g0, int g1)>();
+            int bs = -1;
+            for (int iy = 0; iy < gh; iy++)
             {
-                if (rowL[y] >= 40)
+                if (rowL[iy] >= 40)
                 {
-                    if (bs < 0) bs = y;
-                    bp = y;
+                    if (bs < 0) bs = iy;
                 }
                 else if (bs >= 0)
                 {
-                    if (bp - bs >= 24) bands.Add((bs, bp));
+                    if (iy - bs >= BandMinRows) bands.Add((bs, iy - 1));
                     bs = -1;
                 }
             }
-            if (bs >= 0 && bp - bs >= 24) bands.Add((bs, bp));
+            if (bs >= 0 && gh - bs >= BandMinRows) bands.Add((bs, gh - 1));
 
             bool dbg = Environment.GetEnvironmentVariable("CTR_DEBUG") == "1";
-            if (dbg) Console.Error.WriteLine($"[CTR] bands={string.Join(";", bands.Select(b => $"[{b.y0},{b.y1}]"))}");
+            if (dbg) Console.Error.WriteLine($"[CTR] bands=" +
+                string.Join(";", bands.Select(b => $"[{b.g0 * 2},{b.g1 * 2}]h{(b.g1 - b.g0 + 1) * 2}")));
 
-            foreach (var (by0, by1) in bands)
+            foreach (var (g0, g1) in bands)
             {
-                if (by1 - by0 > 70) continue;
-                int bh = by1 - by0;
+                int rows = g1 - g0 + 1;
+                if (rows > BandMaxRows) continue;
 
-                // 带内列光剖面（全 x 范围步进 2，包括纯黑列 L=0）
-                int xLo = int.MaxValue, xHi = int.MinValue;
-                foreach (var (x, y) in light)
+                // 窗口列表：矮带整带；高带滑窗
+                var wins = new List<(int wy0, int wy1)>();
+                if (rows <= 35)
                 {
-                    if (y >= by0 && y <= by1)
-                    {
-                        if (x < xLo) xLo = x;
-                        if (x > xHi) xHi = x;
-                    }
+                    wins.Add((g0, g1));
                 }
-                if (xLo >= xHi) continue;
-                int nc = (xHi - xLo) / 2 + 1;
-                var L = new int[nc];
-                var xs = new int[nc];
-                int maxL = 0;
-                for (int i = 0; i < nc; i++)
+                else
                 {
-                    xs[i] = xLo + i * 2;
-                    int cnt = 0;
-                    for (int y = by0; y <= by1; y += 2)
-                        if (light.Contains((xs[i], y))) cnt++;
-                    L[i] = cnt;
-                    if (cnt > maxL) maxL = cnt;
+                    foreach (int wh in WinRows)
+                        for (int wy0 = g0; wy0 + wh - 1 <= g1; wy0 += 2)
+                            wins.Add((wy0, wy0 + wh - 1));
                 }
-                if (maxL < 20) continue;
-                if (dbg) Console.Error.WriteLine($"[CTR] band[{by0},{by1}] maxL={maxL} x[{xLo},{xHi}]");
 
-                double thFull = 0.5 * maxL, thGap = 0.15 * maxL, thStar = 0.75 * maxL, thLeft = 0.35 * maxL;
-
-                // ---- 扫 ✦ 特征模式
-                int i2 = 0;
-                while (i2 < nc)
-                {
-                    if (L[i2] < thFull) { i2++; continue; }
-                    int j = i2;
-                    while (j < nc && L[j] >= thFull) j++;
-                    if (xs[j - 1] - xs[i2] >= 40)
-                    {
-                        if (dbg) Console.Error.WriteLine($"[CTR] run[{xs[i2]},{xs[j - 1]}] len={xs[j - 1] - xs[i2]}");
-                        // 过渡+黑隙+星+回光
-                        int k = j, gapcnt = 0, star = -1;
-                        while (k < nc && xs[k] - xs[j] < 50)
-                        {
-                            if (L[k] <= thGap) gapcnt++;
-                            else if (L[k] > 0 && L[k] <= thStar && gapcnt >= 4) { star = k; break; }
-                            k++;
-                        }
-                        if (star >= 0)
-                        {
-                            if (dbg) Console.Error.WriteLine($"[CTR]   star@{xs[star]} gapcnt={gapcnt}");
-                            int m = star + 1; bool back = false;
-                            while (m < nc && xs[m] - xs[star] < 28)
-                            {
-                                if (L[m] >= thFull) { back = true; break; }
-                                m++;
-                            }
-                            if (back)
-                            {
-                                int capRight = xs[j - 1];
-                                if (dbg) Console.Error.WriteLine($"[CTR]   ✦模式命中 capRight={capRight}");
-                                // 左缘：低阈值扫描，容 2 格（4px）缺口
-                                int p = j - 1, miss = 0, iLeft = j - 1;
-                                while (p > 0)
-                                {
-                                    p--;
-                                    if (L[p] >= thLeft) { iLeft = p; miss = 0; }
-                                    else if (++miss > 2) break;
-                                }
-                                int capW = capRight - xs[iLeft];
-                                if (dbg) Console.Error.WriteLine($"[CTR]   capLeft={xs[iLeft]} capW={capW}");
-                                if (capW >= 60 && capW <= 500)
-                                    TryOcr(f, light, xs[iLeft], capRight, by0, by1, result);
-                            }
-                        }
-                    }
-                    i2 = j;
-                }
+                foreach (var (wy0, wy1) in wins)
+                    ScanWindow(f, S, gw, wy0, wy1, result, dbg);
             }
-            return result;
+
+            // ---- 去重：60px 内的同位置读数只留一个
+            var dedup = new List<CounterRead>();
+            foreach (var r in result)
+                if (!dedup.Any(d => Math.Abs(d.X0 - r.X0) < 60 && Math.Abs(d.Y0 - r.Y0) < 60))
+                    dedup.Add(r);
+            return dedup;
+        }
+
+        /// <summary>对一个行窗口做列光剖面（前缀和 O(1)/列）+ ✦/黑钮锚点扫描 + OCR</summary>
+        static void ScanWindow(Frame f, int[,] S, int gw, int wy0, int wy1,
+            List<CounterRead> result, bool dbg)
+        {
+            int by0 = wy0 * GridStep, by1 = wy1 * GridStep;
+            int nc = gw;
+            var L = new int[nc];
+            var xs = new int[nc];
+            int maxL = 0;
+            for (int ix = 0; ix < nc; ix++)
+            {
+                xs[ix] = ix * GridStep;
+                L[ix] = S[wy1 + 1, ix] - S[wy0, ix];
+                if (L[ix] > maxL) maxL = L[ix];
+            }
+            if (maxL < 12) return;
+
+            // 调试：CTR_WIN=by0,by1 指定窗口打印列光剖面
+            string dbgWin = Environment.GetEnvironmentVariable("CTR_WIN");
+            if (dbgWin == $"{by0},{by1}")
+                Console.Error.WriteLine("[CTR] profile " + string.Join(",",
+                    Enumerable.Range(0, nc).Where(ix => L[ix] > 0).Select(ix => $"{xs[ix]}:{L[ix]}")));
+
+            double thFull = 0.5 * maxL, thGap = 0.45 * maxL, thLeft = 0.35 * maxL;
+
+            int i2 = 0;
+            while (i2 < nc)
+            {
+                if (L[i2] < thFull) { i2++; continue; }
+                int j = i2;
+                while (j < nc && L[j] >= thFull) j++;
+                if (xs[j - 1] - xs[i2] >= 40)
+                {
+                    // 统一锚点：全光段结束后 80px 内，≥4 格显著暗列 + 回到全光
+                    // （旧主题 = 黑隙→星列→☰圆钮，回光最远 ~50+28=78px；
+                    //   新主题 = 黑圆钮→☰区，均匹配）。
+                    // 黑隙阈值取 0.45×maxL：新皮肤黑钮内嵌浅蓝星（列光 5~12），
+                    // 旧阈值 0.15×maxL 会被星形像素打断。名牌误锚由 OCR MAD 兜底。
+                    int k = j, gapcnt = 0; bool hit = false;
+                    while (k < nc && xs[k] - xs[j] < 80)
+                    {
+                        if (L[k] <= thGap) gapcnt++;
+                        else if (L[k] >= thFull && gapcnt >= 4) { hit = true; break; }
+                        k++;
+                    }
+                    if (hit)
+                    {
+                        if (dbg) Console.Error.WriteLine(
+                            $"[CTR] win[{by0},{by1}] 锚点 capRight={xs[j - 1]} gapcnt={gapcnt} maxL={maxL}");
+                        // 左缘：低阈值扫描，容 2 格（4px）缺口
+                        int p = j - 1, miss = 0, iLeft = j - 1;
+                        while (p > 0)
+                        {
+                            p--;
+                            if (L[p] >= thLeft) { iLeft = p; miss = 0; }
+                            else if (++miss > 2) break;
+                        }
+                        int capW = xs[j - 1] - xs[iLeft];
+                        if (capW >= 60 && capW <= 500)
+                            TryOcr(f, xs[iLeft], xs[j - 1], by0, by1, result);
+                    }
+                }
+                i2 = j;
+            }
         }
 
         /// <summary>对 [capLeft,capRight]×[by0,by1] 的数字胶囊 OCR：右起收集、大间隔截断、粘连拆分、模板匹配</summary>
-        static void TryOcr(Frame f, HashSet<(int, int)> light,
-            int capLeft, int capRight, int by0, int by1, List<CounterRead> result)
+        static void TryOcr(Frame f, int capLeft, int capRight, int by0, int by1, List<CounterRead> result)
         {
             int w = f.W;
             var bits = f.Bits;
@@ -174,14 +194,13 @@ namespace WtClickerGUI
             int capW = capRight - capLeft;
             int tx0 = capLeft + (int)(capW * 0.03);
             int tx1 = capRight - (int)(capW * 0.02);
-            // 竖直中心区：数字在栏内居中；桌宠耳朵/尾巴可能从顶上垂进来（黑描边会
-            // 污染字形上缘），故上缘收 25%、下缘收 18%（数字实测 284~300 / 带 268~316）
-            int ty0 = by0 + (int)(bh * 0.25), ty1 = by1 - (int)(bh * 0.18);
+            // 温和竖直裁剪（悬垂描边污染主要由字形行段清理兜底）；蓝皮肤数字
+            // RGB≈(21,26,37)、暖皮肤 ≈(74,52,35)，lum<135 均可靠检出
+            int ty0 = by0 + (int)(bh * 0.20), ty1 = by1 - (int)(bh * 0.12);
             int rh = ty1 - ty0, rw = tx1 - tx0;
             if (rh < 14 || rw < 24) return;
 
             var dark = new bool[rh, rw];
-            var colSum = new int[rw];
             for (int y = 0; y < rh; y++)
             {
                 int row = (ty0 + y) * w * 4;
@@ -189,9 +208,23 @@ namespace WtClickerGUI
                 {
                     int i = row + (tx0 + x) * 4;
                     int lum = (bits[i] + bits[i + 1] + bits[i + 2]) / 3;
-                    if (lum < 135) { dark[y, x] = true; colSum[x]++; }
+                    dark[y, x] = lum < 135;
                 }
             }
+            // 水平边框线剔除：整行暗像素占比过高的行是胶囊描边弧线（会把所有
+            // 字形粘连成一个大段 → 无法切分）。v4 靠更紧的竖直裁剪避开，v5 裁剪
+            // 放宽后改为此行级过滤（数字行的暗像素只占宽度 ~10-20%，不会误伤）。
+            for (int y = 0; y < rh; y++)
+            {
+                int dc = 0;
+                for (int x = 0; x < rw; x++) if (dark[y, x]) dc++;
+                if (dc > rw * 0.6)
+                    for (int x = 0; x < rw; x++) dark[y, x] = false;
+            }
+            var colSum = new int[rw];
+            for (int y = 0; y < rh; y++)
+                for (int x = 0; x < rw; x++)
+                    if (dark[y, x]) colSum[x]++;
             var segs = new List<(int s, int e)>();
             bool inSeg = false; int st = 0;
             for (int x = 0; x < rw; x++)
@@ -201,23 +234,6 @@ namespace WtClickerGUI
             }
             if (inSeg) segs.Add((st, rw));
             segs.RemoveAll(g => g.e - g.s < 3);
-            if (segs.Count == 0) return;
-
-            // ---- 非字形段过滤（2026-10-31 实机 2899 帧确诊）：
-            //      胶囊左侧圆角边框在行带内形成一个高仅 ~5px 的扁暗段（w8），
-            //      而真数字字形高 ~0.56×rh。扁段混入后模板匹配必失败并 return，
-            //      整次读数被一个边框杀死 → 次数永远「未读取」。
-            //      逐段实测竖直跨度，剔除高 < 0.45×rh 的段（数字/字母均 ≥0.5×rh）。
-            var real = new List<(int s, int e)>(segs.Count);
-            foreach (var g in segs)
-            {
-                int rmin = int.MaxValue, rmax = int.MinValue;
-                for (int y = 0; y < rh; y++)
-                    for (int x = g.s; x < g.e; x++)
-                        if (dark[y, x]) { if (y < rmin) rmin = y; if (y > rmax) rmax = y; }
-                if (rmin <= rmax && rmax - rmin + 1 >= 0.45 * rh) real.Add(g);
-            }
-            segs = real;
             if (segs.Count == 0) return;
             bool dbg = Environment.GetEnvironmentVariable("CTR_DEBUG") == "1";
             if (dbg) Console.Error.WriteLine($"[CTR]   OCR tx[{tx0},{tx1}] ty[{ty0},{ty1}] rh={rh} 段=" +
@@ -235,36 +251,62 @@ namespace WtClickerGUI
                 picked.Insert(0, segs[gi]);
             }
             if (picked.Count == 0) return;
-            if (dbg) Console.Error.WriteLine($"[CTR]   选取=" +
-                string.Join(",", picked.Select(g => $"({g.s + tx0},{g.e + tx0})w{g.e - g.s}")));
 
             // 粘连拆分：宽段按估计字宽均分
             double digitW = 0.42 * rh;
             var glyphs = new List<(int s, int e)>();
             foreach (var (s, e) in picked)
             {
-                int gw = e - s;
-                int parts = Math.Max(1, (int)Math.Round(gw / digitW));
+                int gw2 = e - s;
+                int parts = Math.Max(1, (int)Math.Round(gw2 / digitW));
                 if (parts <= 1) { glyphs.Add((s, e)); continue; }
                 for (int q = 0; q < parts; q++)
-                    glyphs.Add((s + (int)Math.Round(gw * q / (double)parts),
-                                s + (int)Math.Round(gw * (q + 1) / (double)parts)));
+                    glyphs.Add((s + (int)Math.Round(gw2 * q / (double)parts),
+                                s + (int)Math.Round(gw2 * (q + 1) / (double)parts)));
             }
             if (glyphs.Count == 0 || glyphs.Count > 8) return;
-            if (dbg) Console.Error.WriteLine($"[CTR]   拆分后=" +
-                string.Join(",", glyphs.Select(g => $"({g.s + tx0},{g.e + tx0})w{g.e - g.s}")));
+
+            // ---- 每字形竖直范围 = 最大连续活动行段（行内暗像素 ≥ max(2, 段宽/8) 视为活动）。
+            //      悬垂的桌宠耳朵/尾巴描边与数字仅个别行相连时，孤立碎行被排除。
+            int n = glyphs.Count;
+            var gy0s = new int[n]; var gy1s = new int[n];
+            int maxH = 0;
+            for (int gi = 0; gi < n; gi++)
+            {
+                var (s, e) = glyphs[gi];
+                int act = Math.Max(2, (e - s) / 8);
+                int bestLen = 0, bestS = -1, curS = -1, curLen = 0;
+                for (int y = 0; y < rh; y++)
+                {
+                    int c = 0;
+                    for (int x = s; x < e; x++) if (dark[y, x]) c++;
+                    if (c >= act)
+                    {
+                        if (curS < 0) { curS = y; curLen = 1; } else curLen++;
+                        if (curLen > bestLen) { bestLen = curLen; bestS = curS; }
+                    }
+                    else curS = -1;
+                }
+                if (bestS < 0) { gy0s[gi] = -1; gy1s[gi] = -1; continue; }
+                gy0s[gi] = bestS; gy1s[gi] = bestS + bestLen - 1;
+                if (bestLen > maxH) maxH = bestLen;
+            }
+            // 高度过滤：≥8px 且 ≥0.5×最高字形（胶囊圆角边框、碎描边被剔除）
+            int minH = Math.Max(8, maxH / 2);
 
             long value = 0; int nDigits = 0;
-            foreach (var (s, e) in glyphs)
+            int GW = CountdownReader.GlyphW, GH = CountdownReader.GlyphH;
+            for (int gi = 0; gi < n; gi++)
             {
-                int gy0 = int.MaxValue, gy1 = int.MinValue;
-                for (int y = 0; y < rh; y++)
-                    for (int x = s; x < e; x++)
-                        if (dark[y, x]) { if (y < gy0) gy0 = y; if (y > gy1) gy1 = y; }
-                if (gy0 > gy1) return;
-
-                var gl = Normalize(dark, s, e, gy0, gy1);
-                int GW = CountdownReader.GlyphW, GH = CountdownReader.GlyphH;
+                if (gy0s[gi] < 0) { if (gi == 0) continue; return; }
+                int gh2 = gy1s[gi] - gy0s[gi] + 1;
+                if (gh2 < minH)
+                {
+                    if (dbg) Console.Error.WriteLine($"[CTR]   字形{gi} 过扁 h={gh2}<{minH} 丢弃");
+                    if (gi == 0) continue;          // 最左（污染侧）可丢弃
+                    return;
+                }
+                var gl = Normalize(dark, glyphs[gi].s, glyphs[gi].e, gy0s[gi], gy1s[gi]);
                 int best = -1; double bMad = 9, sec = 9;
                 for (int g = 0; g < 11; g++)
                 {
@@ -277,8 +319,9 @@ namespace WtClickerGUI
                 }
                 if (best < 0 || best == 10 || bMad > 0.30 || sec - bMad < 0.015)
                 {
-                    if (dbg) Console.Error.WriteLine($"[CTR]   模板匹配失败 best={best} bMad={bMad:F3} sec={sec:F3}");
-                    return;
+                    if (dbg) Console.Error.WriteLine($"[CTR]   模板匹配失败 gi={gi} best={best} bMad={bMad:F3} sec={sec:F3}");
+                    if (gi == 0) continue;          // 最左字形失败=边缘污染，丢弃重试
+                    return;                          // 中间字形失败=不可信，整读放弃
                 }
                 value = value * 10 + best;
                 nDigits++;

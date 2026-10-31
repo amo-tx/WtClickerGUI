@@ -481,7 +481,18 @@ namespace WtClickerGUI
             //      过滤访客名牌数字等误检；位置突变连续 3s（桌宠被拖走）则
             //      重新捕获，避免死锁在旧位置导致卡片永远「—」。
             //      读数展示与恢复调度参考；气泡排队期间调度不依赖此值。
-            var cs = CounterReader.Find(frame);
+            List<CounterReader.CounterRead> cs;
+            try { cs = CounterReader.Find(frame); }
+            catch (Exception ex)
+            {
+                // 不再静默吞掉：2026-10-31 晚「离线同帧可读、引擎必失败」的排障表明
+                // VisLoop 的 catch{} 会把读取器异常全部掩盖（倒计时在前所以正常、
+                // 次数在后永远未读取）。异常必须留痕。
+                Log?.Invoke($"⚠️ 次数读取异常: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
+                cs = new List<CounterReader.CounterRead>();
+            }
+            if (cs.Count == 0)
+                DumpFailFrame(frame);
             if (cs.Count > 0)
             {
                 CounterReader.CounterRead best = null;
@@ -508,8 +519,11 @@ namespace WtClickerGUI
                 }
                 else
                 {
+                    // 重新捕获：优先位数最多的读数；≥2 位才采信 —— 名牌笔画偶发
+                    // 匹配出单数字假读（如「8」），真计数在连点下 1s 内必然回到 2 位以上
                     best = cs[0];
                     foreach (var c in cs) if (c.Digits > best.Digits) best = c;
+                    if (best.Digits < 2) best = null;
                 }
                 if (best != null)
                 {
@@ -528,6 +542,28 @@ namespace WtClickerGUI
         }
 
         /// <summary>视觉独立线程：专职 0.5s 一帧截图+识别，点击线程完全不被阻塞。</summary>
+        double _lastCtrDump = -999;
+        int _ctrDumps;
+
+        /// <summary>次数读不到时把引擎真实帧落盘（限 2 帧、间隔≥10s），供 ReaderTest 离线复现。</summary>
+        void DumpFailFrame(Frame f)
+        {
+            if (f?.Bits == null) return;
+            double now = Now();
+            if (_ctrDumps >= 2 || now - _lastCtrDump < 10) return;
+            _lastCtrDump = now; _ctrDumps++;
+            try
+            {
+                string path = System.IO.Path.Combine(AppContext.BaseDirectory, $"ctr_fail_{_ctrDumps}.bin");
+                using var fs = new System.IO.FileStream(path, System.IO.FileMode.Create);
+                fs.Write(BitConverter.GetBytes(f.W), 0, 4);
+                fs.Write(BitConverter.GetBytes(f.H), 0, 4);
+                fs.Write(f.Bits, 0, f.Bits.Length);
+                Log?.Invoke($"⚠️ 次数未读取，引擎帧已落盘 {path}（{f.W}x{f.H}）——可用 ReaderTest 离线复现");
+            }
+            catch (Exception ex) { Log?.Invoke("帧落盘失败: " + ex.Message); }
+        }
+
         void VisLoop()
         {
             while (!_stop)

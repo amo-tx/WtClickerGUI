@@ -13,6 +13,7 @@
     <Compile Include="..\..\ChestDetector.cs" Link="ChestDetector.cs" />
     <Compile Include="ChestDiag.cs" Link="ChestDiag.cs" />
     <Compile Include="FrameStub.cs" Link="FrameStub.cs" />
+    <Compile Include="LiveCap.cs" Link="LiveCap.cs" />
     <Compile Include="Program.cs" Link="Program.cs" />
   </ItemGroup>
 </Project>
