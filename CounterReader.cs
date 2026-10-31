@@ -239,8 +239,12 @@ namespace WtClickerGUI
             }
         }
 
-        /// <summary>对 [capLeft,capRight]×[by0,by1] 的数字胶囊 OCR：右起收集、大间隔截断、粘连拆分、模板匹配。
-        /// tx1Override &gt; 0 时强制 OCR 右缘（黑圆钮锚点用：止于圆钮左缘，星形像素不进段列表）。</summary>
+        /// <summary>对 [capLeft,capRight]×[by0,by1] 的数字胶囊 OCR：行活动分组 + 右起收集、大间隔截断、粘连拆分、模板匹配。
+        /// tx1Override &gt; 0 时强制 OCR 右缘（黑圆钮锚点用：止于圆钮左缘，星形像素不进段列表）。
+        /// v6 行分组（2026-11-01 实机失败帧 dist/ctr_fail_1.bin 确诊）：桌宠移动后身体/头发悬垂进
+        /// OCR 窗口顶部，其暗像素恰好垫高数字间隙列的 colSum → 「3+4」「1+3」粘成 w29/w34 宽段，
+        /// 粘连拆分切缝错位 → MAD 全拒 → 未读取。数字与悬垂污染之间有 ≥6 行净空带，按行活动度
+        /// 分组后组内重切分即可干净分离；自下而上尝试（宠物在胶囊上方，数字组在最下），命中即返回。</summary>
         static void TryOcr(Frame f, int capLeft, int capRight, int by0, int by1, List<CounterRead> result,
             int tx1Override = -1)
         {
@@ -250,7 +254,7 @@ namespace WtClickerGUI
             int capW = capRight - capLeft;
             int tx0 = capLeft + (int)(capW * 0.03);
             int tx1 = tx1Override > 0 ? tx1Override : capRight - (int)(capW * 0.02);
-            // 温和竖直裁剪（悬垂描边污染主要由字形行段清理兜底）；蓝皮肤数字
+            // 温和竖直裁剪（悬垂描边污染主要由行分组兜底）；蓝皮肤数字
             // RGB≈(21,26,37)、暖皮肤 ≈(74,52,35)，lum<135 均可靠检出
             int ty0 = by0 + (int)(bh * 0.20), ty1 = by1 - (int)(bh * 0.12);
             int rh = ty1 - ty0, rw = tx1 - tx0;
@@ -277,6 +281,43 @@ namespace WtClickerGUI
                 if (dc > rw * 0.6)
                     for (int x = 0; x < rw; x++) dark[y, x] = false;
             }
+
+            // ---- v6 行活动分组：数字组与悬垂污染组之间有净空行带
+            double digitW = 0.42 * rh;   // 粘连拆分估宽仍按完整窗口高（与 v5 一致：
+                                         // 单数字 w~12 < 1.5×估宽不拆，双数字 w29/34 拆 2）
+            var groups = new List<(int g0, int g1)>();
+            {
+                var rowAct = new int[rh];
+                for (int y = 0; y < rh; y++)
+                {
+                    int c = 0;
+                    for (int x = 0; x < rw; x++) if (dark[y, x]) c++;
+                    rowAct[y] = c;
+                }
+                int s = -1;
+                for (int y = 0; y < rh; y++)
+                {
+                    if (rowAct[y] >= 2) { if (s < 0) s = y; }
+                    else if (s >= 0) { if (y - s >= 6) groups.Add((s, y - 1)); s = -1; }
+                }
+                if (s >= 0 && rh - s >= 6) groups.Add((s, rh - 1));
+            }
+            for (int gi = groups.Count - 1; gi >= 0; gi--)      // 自下而上
+            {
+                int g0 = groups[gi].g0, g1 = groups[gi].g1;
+                var dark2 = new bool[g1 - g0 + 1, rw];
+                for (int y = g0; y <= g1; y++)
+                    for (int x = 0; x < rw; x++) dark2[y - g0, x] = dark[y, x];
+                if (OcrBand(dark2, tx0, ty0 + g0, digitW, capLeft, capRight, by0, by1, result))
+                    return;
+            }
+        }
+
+        /// <summary>在给定行组（dark 第一维 = 组内行）内切分并匹配数字。返回是否产出读数。</summary>
+        static bool OcrBand(bool[,] dark, int tx0, int ty0, double digitW,
+            int capLeft, int capRight, int by0, int by1, List<CounterRead> result)
+        {
+            int rh = dark.GetLength(0), rw = dark.GetLength(1);
             var colSum = new int[rw];
             for (int y = 0; y < rh; y++)
                 for (int x = 0; x < rw; x++)
@@ -290,14 +331,13 @@ namespace WtClickerGUI
             }
             if (inSeg) segs.Add((st, rw));
             segs.RemoveAll(g => g.e - g.s < 3);
-            if (segs.Count == 0) return;
+            if (segs.Count == 0) return false;
             bool dbg = Environment.GetEnvironmentVariable("CTR_DEBUG") == "1";
 
             // 非字形段预过滤（2026-10-31 22:xx 奶油皮肤实测教训）：✦ 星形按钮中心
             // 只有 1 行暗像素，但它排在段列表最右——「从右往左收集」从它起步后
             // 立即被 0.9×rh 大间隔截断，数字段全部落选 → 整读失败（次数永久过期）。
-            // 先算每段最大连续活动行数，<8px 的非字形段（星心/碎描边）提前剔除，
-            // 收集逻辑就能直接从数字段起步。数字高 ≥18px（rh 的 0.5 倍），阈值 8 安全。
+            // 组内行高≈数字实高，字形应占组高 ≥40%；阈值下限 4 行。
             segs.RemoveAll(g =>
             {
                 int act = Math.Max(2, (g.e - g.s) / 8);
@@ -309,12 +349,13 @@ namespace WtClickerGUI
                     if (c >= act) { curLen++; if (curLen > bestLen) bestLen = curLen; }
                     else curLen = 0;
                 }
-                if (dbg && bestLen < 8)
-                    Console.Error.WriteLine($"[CTR]   非字形段 x[{g.s + tx0},{g.e + tx0}] 最大连续活动行={bestLen}<8 剔除");
-                return bestLen < 8;
+                bool rej = bestLen < Math.Max(4, rh * 0.4);
+                if (dbg && rej)
+                    Console.Error.WriteLine($"[CTR]   非字形段 x[{g.s + tx0},{g.e + tx0}] 最大连续活动行={bestLen}<{Math.Max(4, (int)(rh * 0.4))} 剔除");
+                return rej;
             });
-            if (segs.Count == 0) return;
-            if (dbg) Console.Error.WriteLine($"[CTR]   OCR tx[{tx0},{tx1}] ty[{ty0},{ty1}] rh={rh} 段=" +
+            if (segs.Count == 0) return false;
+            if (dbg) Console.Error.WriteLine($"[CTR]   OCR band ty[{ty0},{ty0 + rh}] rh={rh} 段=" +
                 string.Join(",", segs.Select(g => $"({g.s + tx0},{g.e + tx0})w{g.e - g.s}")));
 
             // 从右往左收集：遇到大间隔（用户名与计数的布局间隔）即停
@@ -328,10 +369,9 @@ namespace WtClickerGUI
                 }
                 picked.Insert(0, segs[gi]);
             }
-            if (picked.Count == 0) return;
+            if (picked.Count == 0) return false;
 
             // 粘连拆分：宽段按估计字宽均分
-            double digitW = 0.42 * rh;
             var glyphs = new List<(int s, int e)>();
             foreach (var (s, e) in picked)
             {
@@ -342,7 +382,7 @@ namespace WtClickerGUI
                     glyphs.Add((s + (int)Math.Round(gw2 * q / (double)parts),
                                 s + (int)Math.Round(gw2 * (q + 1) / (double)parts)));
             }
-            if (glyphs.Count == 0 || glyphs.Count > 8) return;
+            if (glyphs.Count == 0 || glyphs.Count > 8) return false;
 
             // ---- 每字形竖直范围 = 最大连续活动行段（行内暗像素 ≥ max(2, 段宽/8) 视为活动）。
             //      悬垂的桌宠耳朵/尾巴描边与数字仅个别行相连时，孤立碎行被排除。
@@ -372,17 +412,17 @@ namespace WtClickerGUI
             // 高度过滤：≥8px 且 ≥0.5×最高字形（胶囊圆角边框、碎描边被剔除）
             int minH = Math.Max(8, maxH / 2);
 
-            long value = 0; int nDigits = 0;
+            long value = 0; int nDigits = 0; double maxMad = 0;
             int GW = CountdownReader.GlyphW, GH = CountdownReader.GlyphH;
             for (int gi = 0; gi < n; gi++)
             {
-                if (gy0s[gi] < 0) { if (gi == 0) continue; return; }
+                if (gy0s[gi] < 0) { if (gi == 0) continue; return false; }
                 int gh2 = gy1s[gi] - gy0s[gi] + 1;
                 if (gh2 < minH)
                 {
                     if (dbg) Console.Error.WriteLine($"[CTR]   字形{gi} 过扁 h={gh2}<{minH} 丢弃");
                     if (gi == 0) continue;          // 最左（污染侧）可丢弃
-                    return;
+                    return false;
                 }
                 var gl = Normalize(dark, glyphs[gi].s, glyphs[gi].e, gy0s[gi], gy1s[gi]);
                 int best = -1; double bMad = 9, sec = 9;
@@ -399,13 +439,21 @@ namespace WtClickerGUI
                 {
                     if (dbg) Console.Error.WriteLine($"[CTR]   模板匹配失败 gi={gi} best={best} bMad={bMad:F3} sec={sec:F3}");
                     if (gi == 0) continue;          // 最左字形失败=边缘污染，丢弃重试
-                    return;                          // 中间字形失败=不可信，整读放弃
+                    return false;                    // 中间字形失败=不可信，整读放弃
                 }
                 value = value * 10 + best;
+                if (bMad > maxMad) maxMad = bMad;
                 nDigits++;
             }
-            if (nDigits == 0) return;
+            if (nDigits == 0) return false;
+            // 短读数假阳性（宠物装饰凑出 1 位假「1」等）不在此过滤：MAD 分布与
+            // 真字形重叠（真 0.198~0.266 / 假 0.242~0.299），无法用阈值分离。
+            // 引擎侧已有两道防线：重新捕获只采信 ≥2 位且优先位数最多；锁定后按
+            // 位置距离(150px)就近选取。且余数结转后 1~2 位是合法状态（1005→3），
+            // 这里拒绝会造成冷却期长时间「未读取」。
+            if (dbg) Console.Error.WriteLine($"[CTR]   ✓ 读出 {value}（{nDigits} 位）maxMad={maxMad:F3}");
             result.Add(new CounterRead { Value = value, Digits = nDigits, X0 = capLeft, Y0 = by0, X1 = capRight, Y1 = by1 });
+            return true;
         }
 
         /// <summary>字形裁剪 → 最近邻缩放至 16x24</summary>
