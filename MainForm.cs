@@ -97,7 +97,7 @@ namespace WtClickerGUI
             // AutoSize label 推出窗口外。固定 x 即可。
 
             cfg.Controls.Add(MkLabel(
-                "实际速率由程序按画面自主实时调节：无气泡全速（=上限）；气泡排队期把缺口按剩余冷却摊成匀速（≤上限），攒满即暂停防溢出；宝箱弹出立即点开",
+                "实际速率由程序按画面自主实时调节：无气泡全速攒 1000；气泡排队期持续积攒（开箱扣 1000 余数结转，多点多算不浪费），宝箱弹出立即秒开",
                 18, 62, cfg, InkSoft, 8.5F));
 
             cfg.Controls.Add(MkLabel("注入通道", 18, 108, cfg, Ink, 9.5F, bold: true));
@@ -121,7 +121,8 @@ namespace WtClickerGUI
             _chkChest.CheckedChanged += (s, e) => ApplyConfig();
             _chkHuman = NewCheck("拟人化节奏（抖动 + 微/长休息，防「点击数异常」检测；宝箱紧迫时自动跳过长休息）", 18, 182, cfg);
             _chkHuman.CheckedChanged += (s, e) => ApplyConfig();
-            _chkPaced = NewCheck("气泡期匀速（把门槛缺口按剩余冷却摊成低速匀速点击，无突发更平滑；宝箱产出速率不变）", 18, 214, cfg);
+            _chkPaced = NewCheck("气泡期匀速（已停用：实测开箱余数结转，匀速只会拖慢积攒；保留选项仅为兼容）", 18, 214, cfg);
+            _chkPaced.Enabled = false;
             _chkPaced.Checked = true;
             _chkPaced.CheckedChanged += (s, e) => ApplyConfig();
 

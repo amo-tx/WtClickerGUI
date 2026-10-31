@@ -148,12 +148,20 @@ namespace WtClickerGUI
             {
                 if (!WantRun) { Thread.Sleep(200); continue; }
 
-                // ---- 窗口与注入通道
-                if (!RefreshWindows())
+                // ---- 窗口与注入通道：缓存句柄，仅在失效或每 3s 才重新枚举。
+                //      逐点击 RefreshWindows（Process.GetProcessesByName×2 + EnumWindows×2）
+                //      实测吃掉 ~100ms/次，是「计划 5 CPS 实际只有 3.2」的主因。
+                bool windowsOk = _injectHwnd != IntPtr.Zero && Native.IsWindow(_injectHwnd)
+                              && _mainHwnd != IntPtr.Zero && Native.IsWindow(_mainHwnd);
+                if (!windowsOk || Now() >= _nextWinRefresh)
                 {
-                    EmitStatus("未检测到 WuwaTappo（请先启动 Wuwa Tappo）");
-                    Thread.Sleep(3000);
-                    continue;
+                    if (!RefreshWindows())
+                    {
+                        EmitStatus("未检测到 WuwaTappo（请先启动 Wuwa Tappo）");
+                        Thread.Sleep(3000);
+                        continue;
+                    }
+                    _nextWinRefresh = Now() + 3;
                 }
                 ResolveChannel();
                 if (_injectHwnd == IntPtr.Zero)
@@ -194,7 +202,10 @@ namespace WtClickerGUI
                 bool cdUrgent;
                 lock (_sync) cdUrgent = _cdWasActive && Now() - _cdSeenAt < 6
                                         && _cdRefreshEpoch - Now() < 300;
-                if (Humanize && Now() > _nextMacro && !cdUrgent)
+                // 无气泡排队 = 正在全速攒第一个 1000（用户定义的空窗期）——长休息跳过，
+                // 顺延到有气泡排队的银行期再休（银行期计数富余，休 30-60s 不影响秒开）。
+                bool noQueue = !cdUrgent && !CdActive(Now());
+                if (Humanize && Now() > _nextMacro && !cdUrgent && !noQueue)
                 {
                     var pause = RngD(30, 60);
                     EmitStatus($"长休息 {pause:F0}s（防异常检测）");
@@ -282,15 +293,16 @@ namespace WtClickerGUI
         }
 
         /// <summary>
-        /// 智能调度（10-31 12:10 规则）：全部以「实际看到的画面」为标准——
-        /// 排队宝箱数 = 屏幕上真实可见的倒计时气泡数（CountdownReader 实读，3s 内见过即有效），
-        /// 门槛 = 气泡数 × 1000；计数用 5s 内的实时 OCR 读数，过期/缺失不拿旧值决策。
-        /// 最快拿宝箱策略（自动选择）：
-        ///   ① 宝箱图标出现 → 最高优先级立即点击（领取即重置计数，拖久反而浪费溢出）；
-        ///   ② 有气泡排队且实时计数 ≥ 门槛 → 暂停防溢出（多点的全浪费）；
-        ///   ③ 有气泡排队但计数 < 门槛 → 全速补足门槛；
+        /// 智能调度（10-31 23:58 修订）：关键实测——开箱 = 计数扣 1000、余数结转
+        /// （10-31 23:54 开箱前 1,087+3 次注入，开箱后 91 ≈ 1090−1000+1）。
+        /// 因此「到门槛就暂停防溢出」是错误前提：多点的计数不浪费，只会让
+        /// 下一次积攒更短、并保证气泡成熟宝箱弹出时计数必 ≥ 1000 秒开。
+        /// 排队气泡数 = 屏幕上真实可见的倒计时气泡数（3s 内读到即有效）。
+        /// 策略：
+        ///   ① 宝箱图标出现 → 最高优先级立即点击（独立线程 0.2s 巡检）；
+        ///   ② 有气泡排队 → 持续全速积攒（余数结转，不再到门槛就停）；
+        ///   ③ 仅当计数接近疑似上限（≥9000）才保守停手，防游戏内部截断；
         ///   ④ 无气泡 → 全速攒下一个 1000。
-        /// 不做任何「内部推断」：不说「下一个会变气泡」，出现什么调度什么。
         /// </summary>
         (double wait, string desc) PlanWait()
         {
@@ -301,47 +313,29 @@ namespace WtClickerGUI
                 int queued;
                 lock (_sync) queued = Math.Max(1, _cdEpochs.Count);
                 double rem0 = Math.Max(0, _cdRefreshEpoch - now);
-                // 调度只信 5s 内的实时 OCR 读数（0.5s 扫一次，5s = 10 轮容忍）。
-                // 暂停判定放宽到 30s 内的最近读数（保守方向）：计数只会增（除非
-                // 开箱重置，而开箱时门槛同步回落），拿稍旧的偏高读数暂停不会漏攒，
-                // 但能避免 OCR 短暂失效期间全速冲过门槛把计数点溢出浪费。
-                long v; bool vFresh;
+                long v, v30;
                 lock (_sync)
                 {
                     double age = now - _countSeenAt;
-                    vFresh = age < 5;
-                    v = age < 30 ? _countVal : -1;
+                    v = age < 5 ? _countVal : -1;
+                    v30 = age < 30 ? _countVal : -1;
                 }
-                long target = 1000L * queued;    // 每个排队宝箱领取需扣 1000
-                if (v >= 0 && v >= target)
+                // 保守上限护栏：计数极端偏高时停手（游戏内部是否有截断未知，宁停勿险）。
+                // 正常 5 CPS 攒到 9000 需 ~30 分钟，实际永远碰不到；只是兜底。
+                if (v30 >= 9000)
                 {
                     Paused = true;
-                    _effCps = 0;   // 暂停注入；等待循环内仍立即响应宝箱图标
-                    return (0.4, $"策略=暂停防溢出：{queued} 个气泡排队冷却 {TimeSpan.FromSeconds(rem0):mm\\:ss}" +
-                                 $"（{(vFresh ? "实时" : $"{now - _countSeenAt:F0}s 前的读数（保守暂停）")}计数 {v:N0} ≥ 门槛 {target:N0}，再点必溢出），气泡消失宝箱弹出即自动点击");
+                    _effCps = 0;
+                    return (0.4, $"策略=保守暂停：计数 {v30:N0} 已近疑似上限 9000（防游戏内部截断），" +
+                                 $"{queued} 个气泡排队冷却 {TimeSpan.FromSeconds(rem0):mm\\:ss}，气泡成熟宝箱弹出即自动点击");
                 }
+                // 「匀速补门槛」已停用（10-31 23:58）：其实测前提（到门槛就该停）
+                // 被开箱余数结转推翻——匀速把积攒拖到 0.25~1 CPS 爬行 30 分钟，
+                // 是空窗期制造机。PacedBubble 配置键保留仅为兼容旧 config.ini。
                 Paused = false;
-                string why = v < 0
-                    ? "实时计数未读到（不拿旧值决策）"
-                    : $"实时计数 {v:N0} < 门槛 {target:N0}";
-                // 匀速模式：缺口 (target−v) 摊到剩余冷却（留 45s 安全余量），
-                // 得出恒定低速速率（借鉴 WuwaTappoClicker 的 (30min−15s)/2000 ≈ 1.12 CPS 节奏）。
-                // 与全速殊途同归（宝箱产出瓶颈是 30min 冷却），但无突发、无死停。
-                if (PacedBubble && vFresh && v >= 0 && rem0 > 60)
-                {
-                    double need = target - v;
-                    double rate = need / Math.Max(30, rem0 - 45);
-                    if (rate < Cps)
-                    {
-                        if (rate < 0.25) rate = 0.25;
-                        _effCps = rate;
-                        return (0, $"策略=匀速补门槛：{queued} 个气泡排队 {TimeSpan.FromSeconds(rem0):mm\\:ss}" +
-                                   $"（缺口 {need:N0} 次 / 剩余 {rem0:F0}s → {rate:F2} CPS 匀速），到点刚好攒满，期间静候宝箱弹出");
-                    }
-                }
                 _effCps = Cps;
-                return (0, $"策略=全速补门槛：{queued} 个气泡排队 {TimeSpan.FromSeconds(rem0):mm\\:ss}" +
-                           $"（{why}{(rem0 <= 60 ? "，冷却将尽改全速" : PacedBubble && v >= 0 ? "，缺口所需速率超过上限" : "")}），补足后自动暂停");
+                return (0, $"策略=持续积攒：{queued} 个气泡排队冷却 {TimeSpan.FromSeconds(rem0):mm\\:ss}" +
+                           $"（计数{(v >= 0 ? v.ToString("N0") : "未读取")}；开箱扣 1000 余数结转，多点多算不浪费），气泡成熟宝箱弹出即秒开");
             }
             Paused = false;
             _effCps = Cps;
@@ -415,6 +409,7 @@ namespace WtClickerGUI
         /// <summary>最近一次扫描的可见块数量（-1 = 不在线，-2 = 引擎自扫中）。</summary>
         public volatile int IdleBlobCount = -2;
         double _idleNext;                // 待机视觉节流（0.5s）
+        double _nextWinRefresh;          // 窗口句柄缓存刷新节拍（3s，点击循环提速）
         readonly object _sync = new();
 
         /// <summary>
@@ -975,9 +970,9 @@ namespace WtClickerGUI
             }
             IntPtr lp = (IntPtr)(((cy & 0x7FFF) << 16) | (cx & 0xFFFF));
             Native.PostMessage(hwnd, Native.WM_MOUSEMOVE, Native.Zero, lp);
-            Thread.Sleep(12);
+            Thread.Sleep(8);
             Native.PostMessage(hwnd, Native.WM_LBUTTONDOWN, Native.MK_LBUTTON, lp);
-            Thread.Sleep(30);
+            Thread.Sleep(15);
             Native.PostMessage(hwnd, Native.WM_LBUTTONUP, Native.Zero, lp);
         }
 
